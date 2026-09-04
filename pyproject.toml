@@ -1,0 +1,62 @@
+[project]
+name = "enterprise-ai-agent"
+version = "0.1.0"
+description = "Independent enterprise AI agent platform with MCP-only business integrations"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.116.0,<1",
+    "httpx>=0.28.1,<1",
+    "httpx2>=2.12.0,<3",
+    "mcp>=1.12.0,<3",
+    "pydantic>=2.11.0,<3",
+    "pydantic-settings>=2.10.0,<3",
+    "uvicorn[standard]>=0.35.0,<1",
+]
+
+[project.scripts]
+ai-agent = "ai_agent.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.17.0,<2",
+    "pytest>=8.4.0,<10",
+    "pytest-asyncio>=1.1.0,<2",
+    "respx>=0.22.0,<1",
+    "ruff>=0.12.0,<1",
+    "setuptools>=80.0.0,<82",
+]
+
+[build-system]
+requires = ["setuptools>=80.0.0,<82"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ai_agent = ["py.typed"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = [".uv-cache"]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["ai_agent"]
+
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
