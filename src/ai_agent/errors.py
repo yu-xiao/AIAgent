@@ -19,3 +19,23 @@ class ProtocolValidationError(AiAgentError):
 
 class McpConnectionError(AiAgentError):
     """Raised when an MCP server cannot be reached or negotiated safely."""
+
+
+class AuthorizationError(AiAgentError):
+    """Raised when a platform permission or organization boundary denies access."""
+
+
+class ConflictError(AiAgentError):
+    """Raised when a request conflicts with the current resource state."""
+
+
+class ResourceNotFoundError(AiAgentError):
+    """Raised when a tenant-scoped resource does not exist or is not visible."""
+
+
+class RunLimitError(AiAgentError):
+    """Raised when an Agent run would exceed a deterministic hard limit."""
+
+
+class ModelProviderError(AiAgentError):
+    """Raised when the configured model provider fails with a safe public message."""
