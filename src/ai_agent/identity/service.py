@@ -24,6 +24,23 @@ AGENT_USE = "agent:use"
 AGENT_MANAGE = "agent:manage"
 AUDIT_VIEW = "audit:view"
 ORGANIZATION_MEMBER_MANAGE = "organization:member:manage"
+CONNECTION_PERSONAL_CREATE = "connection:personal:create"
+CONNECTION_PERSONAL_DISCONNECT = "connection:personal:disconnect"
+CONNECTION_ORGANIZATION_MANAGE = "connection:organization:manage"
+MCP_SERVER_VIEW = "mcp-server:view"
+MCP_SERVER_MANAGE = "mcp-server:manage"
+TOOL_PERMISSION_USE = "tool:permission:use"
+TOOL_ERP_USE = "tool:erp:use"
+TOOL_MES_USE = "tool:mes:use"
+TOOL_BI_USE = "tool:bi:use"
+TOOL_PERMISSION_BY_SYSTEM = {
+    "permission-system": TOOL_PERMISSION_USE,
+    "permission": TOOL_PERMISSION_USE,
+    "erp": TOOL_ERP_USE,
+    "kingdee": TOOL_ERP_USE,
+    "mes": TOOL_MES_USE,
+    "bi": TOOL_BI_USE,
+}
 ADMIN_ROLE = "organization_admin"
 MEMBER_ROLE = "member"
 
@@ -32,6 +49,15 @@ PERMISSION_DEFINITIONS = {
     AGENT_MANAGE: "Manage Agent definitions and runtime switches.",
     AUDIT_VIEW: "View organization audit records.",
     ORGANIZATION_MEMBER_MANAGE: "Manage organization members and roles.",
+    CONNECTION_PERSONAL_CREATE: "Create personal external connections.",
+    CONNECTION_PERSONAL_DISCONNECT: "Disconnect personal external connections.",
+    CONNECTION_ORGANIZATION_MANAGE: "Manage organization shared connections.",
+    MCP_SERVER_VIEW: "View registered MCP servers.",
+    MCP_SERVER_MANAGE: "Register and manage MCP servers.",
+    TOOL_PERMISSION_USE: "Use PermissionSystem MCP tools.",
+    TOOL_ERP_USE: "Use ERP MCP tools.",
+    TOOL_MES_USE: "Use MES MCP tools.",
+    TOOL_BI_USE: "Use BI MCP tools.",
 }
 
 
@@ -74,6 +100,15 @@ class IdentityService:
                 raise ResourceNotFoundError("Authenticated platform user is unavailable.")
             return user
 
+    async def require_tool_access(
+        self, user_id: UUID, organization_id: UUID, system_code: str
+    ) -> None:
+        permission = TOOL_PERMISSION_BY_SYSTEM.get(system_code.lower())
+        if permission:
+            await self.access(user_id, organization_id, permission)
+        else:
+            await self.access(user_id, organization_id, AGENT_USE)
+
     async def create_organization(self, user_id: UUID, name: str) -> Organization:
         async with self._session_factory() as session, session.begin():
             organization = Organization(name=name)
@@ -105,7 +140,19 @@ class IdentityService:
                     RolePermission(role_id=admin.id, permission_code=code)
                     for code in PERMISSION_DEFINITIONS
                 ]
-                + [RolePermission(role_id=standard.id, permission_code=AGENT_USE)]
+                + [
+                    RolePermission(role_id=standard.id, permission_code=code)
+                    for code in (
+                        AGENT_USE,
+                        CONNECTION_PERSONAL_CREATE,
+                        CONNECTION_PERSONAL_DISCONNECT,
+                        MCP_SERVER_VIEW,
+                        TOOL_PERMISSION_USE,
+                        TOOL_ERP_USE,
+                        TOOL_MES_USE,
+                        TOOL_BI_USE,
+                    )
+                ]
                 + [MemberRole(member_id=member.id, role_id=admin.id)]
             )
             session.add(

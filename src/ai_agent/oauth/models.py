@@ -33,6 +33,7 @@ class OAuthToken(BaseModel):
     refresh_token: SecretStr | None = None
     id_token: SecretStr | None = None
     scope: str | None = None
+    subject: str | None = None
 
     def safe_summary(self) -> dict[str, object]:
         return {

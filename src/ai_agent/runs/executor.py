@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from prometheus_client import Counter, Histogram
@@ -12,6 +13,8 @@ from ai_agent.agents import SingleAgent
 from ai_agent.config import ModelSettings, RunLimitSettings
 from ai_agent.conversations.service import ConversationService
 from ai_agent.errors import ModelProviderError, RunLimitError
+from ai_agent.mcp.gateway import McpGateway
+from ai_agent.mcp.models import RunContext
 from ai_agent.models import ModelMessage, ModelProvider
 from ai_agent.persistence.models import Message, RunStatus
 from ai_agent.runs.events import RunControl, RunEventBus
@@ -35,6 +38,10 @@ class RunExecutor:
         control: RunControl,
         limits: RunLimitSettings,
         model_settings: ModelSettings,
+        gateway: McpGateway | None = None,
+        tool_system_code: str | None = None,
+        tool_allowlist: frozenset[str] | None = None,
+        personal_tools_only: bool = False,
     ) -> None:
         self._conversations = conversations
         self._provider = provider
@@ -43,6 +50,10 @@ class RunExecutor:
         self._control = control
         self._limits = limits
         self._model_settings = model_settings
+        self._gateway = gateway
+        self._tool_system_code = tool_system_code
+        self._tool_allowlist = tool_allowlist
+        self._personal_tools_only = personal_tools_only
         self._tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
@@ -90,6 +101,24 @@ class RunExecutor:
                         max_output_tokens=self._limits.max_output_tokens,
                         trace_id=trace_id,
                         on_delta=on_delta,
+                        gateway=self._gateway,
+                        context=(
+                            RunContext(
+                                organization_id=run.organization_id,
+                                user_id=run.user_id,
+                                trace_id=trace_id,
+                                deadline=datetime.now(UTC)
+                                + timedelta(seconds=self._limits.max_run_seconds),
+                                token_budget=self._limits.max_input_tokens,
+                            )
+                            if self._gateway is not None
+                            else None
+                        ),
+                        max_model_rounds=self._limits.max_model_rounds,
+                        max_tool_calls=self._limits.max_tool_calls,
+                        tool_system_code=self._tool_system_code,
+                        tool_allowlist=self._tool_allowlist,
+                        personal_only=self._personal_tools_only,
                     )
             if result.usage.input_tokens > self._limits.max_input_tokens:
                 raise RunLimitError("Model reported input usage above the configured limit.")
@@ -101,7 +130,7 @@ class RunExecutor:
             )
             if cost > self._limits.max_cost_usd:
                 raise RunLimitError("Model usage exceeded the configured cost limit.")
-            await self._conversations.complete_run(
+            completed = await self._conversations.complete_run(
                 run_id,
                 answer=result.answer,
                 provider=self._provider.provider_name,
@@ -109,7 +138,30 @@ class RunExecutor:
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
                 cost_usd=cost,
+                citations=result.citations,
+                tool_invocations=result.tool_invocations,
             )
+            if not completed:
+                return
+            for invocation in result.tool_invocations:
+                await self._events.publish(
+                    run_id,
+                    "run.tool_invocation",
+                    {
+                        "tool_name": invocation.tool_name,
+                        "server_code": invocation.server_code,
+                        "status": invocation.status,
+                        "arguments_digest": invocation.arguments_digest,
+                        "duration_ms": invocation.duration_ms,
+                        "trace_id": trace_id,
+                    },
+                )
+            for citation in result.citations:
+                await self._events.publish(
+                    run_id,
+                    "run.citation",
+                    {"citation": citation.model_dump(mode="json"), "trace_id": trace_id},
+                )
             RUNS_TOTAL.labels(status=RunStatus.COMPLETED.value).inc()
             await self._events.publish(
                 run_id,
@@ -175,7 +227,14 @@ class RunExecutor:
             await self._control.clear(run_id)
 
     def _bounded_messages(self, stored: list[Message]) -> list[ModelMessage]:
-        system = ModelMessage(role="system", content=self._model_settings.system_prompt)
+        system_prompt = self._model_settings.system_prompt
+        if self._gateway is not None:
+            system_prompt += (
+                " Only state verifiable business facts when they are supported by an MCP Tool "
+                "result in this run. If no Tool evidence is available, say that the fact cannot "
+                "be verified. Never invent permissions, records, or data scope."
+            )
+        system = ModelMessage(role="system", content=system_prompt)
         budget = self._limits.max_input_tokens - self._provider.conservative_input_tokens([system])
         selected: list[ModelMessage] = []
         for item in reversed(stored):

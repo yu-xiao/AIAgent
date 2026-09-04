@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_agent.errors import ConfigurationError
@@ -43,6 +43,9 @@ class PlatformSettings(BaseModel):
     oauth_transaction_ttl_seconds: int = Field(default=600, ge=60, le=1_800)
     session_cookie_name: str = "ai_agent_session"
     post_login_redirect_uri: str = "http://localhost:8000/docs"
+    external_connection_redirect_uri: str = (
+        "http://localhost:8000/api/v1/connections/{server_code}/callback"
+    )
 
 
 class ModelSettings(BaseModel):
@@ -81,11 +84,20 @@ class PermissionSystemSettings(BaseModel):
     service_client_id: str = ""
     service_client_secret: SecretStr = Field(default_factory=lambda: SecretStr(""))
     request_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
-    expected_tools: tuple[str, ...] = (
-        "list_datasets",
-        "describe_dataset",
-        "query_dataset",
+    expected_tools: tuple[str, ...] = Field(
+        default=("list_datasets", "describe_dataset", "query_dataset"),
+        min_length=1,
+        max_length=50,
     )
+
+    @field_validator("expected_tools")
+    @classmethod
+    def validate_expected_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() or len(item) > 200 for item in value):
+            raise ValueError("PermissionSystem expected Tool names must be non-empty.")
+        if len(set(value)) != len(value):
+            raise ValueError("PermissionSystem expected Tool names must be unique.")
+        return value
 
     @property
     def has_probe_token(self) -> bool:
@@ -94,6 +106,19 @@ class PermissionSystemSettings(BaseModel):
     @property
     def has_service_credentials(self) -> bool:
         return bool(self.service_client_id and self.service_client_secret.get_secret_value())
+
+
+class McpGatewaySettings(BaseModel):
+    """Deterministic defaults for the P2 MCP Gateway."""
+
+    enabled: bool = False
+    catalog_ttl_seconds: int = Field(default=300, ge=1, le=86_400)
+    default_timeout_seconds: float = Field(default=10.0, ge=0.1, le=300.0)
+    max_response_bytes: int = Field(default=1_000_000, ge=1_024, le=50_000_000)
+    rate_limit_per_minute: int = Field(default=60, ge=1, le=100_000)
+    max_concurrency: int = Field(default=20, ge=1, le=1_000)
+    circuit_breaker_threshold: int = Field(default=3, ge=1, le=100)
+    circuit_breaker_recovery_seconds: float = Field(default=30.0, ge=1.0, le=3_600.0)
 
 
 class Settings(BaseSettings):
@@ -115,6 +140,7 @@ class Settings(BaseSettings):
     limits: RunLimitSettings = Field(default_factory=RunLimitSettings)
     oidc: OidcSettings = Field(default_factory=OidcSettings)
     permission_system: PermissionSystemSettings = Field(default_factory=PermissionSystemSettings)
+    mcp_gateway: McpGatewaySettings = Field(default_factory=McpGatewaySettings)
 
     def validate_runtime(
         self,
@@ -132,6 +158,12 @@ class Settings(BaseSettings):
             self._validate_oidc()
         if permission_required:
             self._validate_permission_system(require_permission_token=require_permission_token)
+            if self.permission_system.enabled and not self.mcp_gateway.enabled:
+                raise ConfigurationError(
+                    "PermissionSystem integration requires the MCP Gateway to be enabled."
+                )
+        if self.mcp_gateway.enabled:
+            self._validate_mcp_gateway()
         if self.platform.enabled:
             self._validate_platform()
 
@@ -211,6 +243,11 @@ class Settings(BaseSettings):
             require_https=self.environment == Environment.PRODUCTION,
         )
         _validate_http_url(
+            self.platform.external_connection_redirect_uri.replace("{server_code}", "server"),
+            "External connection redirect URI",
+            require_https=self.environment == Environment.PRODUCTION,
+        )
+        _validate_http_url(
             self.model.base_url,
             "Model base URL",
             require_https=self.environment == Environment.PRODUCTION,
@@ -228,6 +265,10 @@ class Settings(BaseSettings):
             raise ConfigurationError(
                 "Positive model input and output prices are required to enforce the run cost cap."
             )
+
+    def _validate_mcp_gateway(self) -> None:
+        if not self.platform.enabled:
+            raise ConfigurationError("P2 MCP Gateway requires the platform to be enabled.")
 
 
 def _validate_client_auth(

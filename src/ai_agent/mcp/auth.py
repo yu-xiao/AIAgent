@@ -10,6 +10,7 @@ import httpx
 from pydantic import SecretStr, ValidationError
 
 from ai_agent.config import TokenEndpointAuthMethod
+from ai_agent.credentials.vault import CredentialVault
 from ai_agent.errors import AuthenticationError, ConfigurationError
 from ai_agent.oauth.models import OAuthToken
 
@@ -17,6 +18,20 @@ from ai_agent.oauth.models import OAuthToken
 class AccessTokenProvider(Protocol):
     async def get_access_token(self) -> SecretStr:
         """Return a usable bearer token without exposing it to logs."""
+
+
+class VaultAccessTokenProvider:
+    """Read a connection token from the vault without exposing its value."""
+
+    def __init__(self, vault: CredentialVault, reference: str) -> None:
+        self._vault = vault
+        self._reference = reference
+
+    async def get_access_token(self) -> SecretStr:
+        credential = await self._vault.get(self._reference)
+        if credential is None or credential.is_expired():
+            raise AuthenticationError("External connection credential is missing or expired.")
+        return credential.access_token
 
 
 class StaticAccessTokenProvider:

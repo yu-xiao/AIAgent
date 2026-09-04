@@ -47,6 +47,29 @@ class RunStatus(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class McpTransport(StrEnum):
+    STREAMABLE_HTTP = "streamable_http"
+
+
+class McpAuthMode(StrEnum):
+    OAUTH_AUTHORIZATION_CODE = "oauth_authorization_code"
+    CLIENT_CREDENTIALS = "client_credentials"
+    API_KEY = "api_key"
+
+
+class ConnectionOwnership(StrEnum):
+    PERSONAL = "personal"
+    ORGANIZATION = "organization"
+
+
+class ConnectionStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    DISCONNECTED = "disconnected"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -246,6 +269,65 @@ class RunStep(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ToolInvocation(Base):
+    """Non-sensitive summary of an MCP invocation attached to a Run."""
+
+    __tablename__ = "tool_invocations"
+    __table_args__ = (
+        Index("ix_tool_invocations_run_created", "run_id", "created_at"),
+        Index("ix_tool_invocations_trace", "trace_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    server_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    arguments_digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    error: Mapped[str | None] = mapped_column(String(500))
+    trace_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class Citation(Base):
+    """Traceable source reference without persisting business payloads."""
+
+    __tablename__ = "citations"
+    __table_args__ = (
+        Index("ix_citations_run_created", "run_id", "created_at"),
+        Index("ix_citations_trace", "trace_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_system: Mapped[str] = mapped_column(String(100), nullable=False)
+    server_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    resource_id: Mapped[str | None] = mapped_column(String(300))
+    queried_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    trace_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, index=True)
+    partial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class ModelUsage(Base):
     __tablename__ = "model_usage"
 
@@ -261,6 +343,174 @@ class ModelUsage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class McpServerDefinition(TimestampMixin, Base):
+    __tablename__ = "mcp_server_definitions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_mcp_servers_org_code"),
+        Index("ix_mcp_servers_org_enabled", "organization_id", "enabled"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    system_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    mcp_url: Mapped[str] = mapped_column(String(2_000), nullable=False)
+    transport: Mapped[McpTransport] = mapped_column(
+        Enum(
+            McpTransport,
+            native_enum=False,
+            length=40,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=McpTransport.STREAMABLE_HTTP,
+    )
+    auth_mode: Mapped[McpAuthMode] = mapped_column(
+        Enum(
+            McpAuthMode,
+            native_enum=False,
+            length=50,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+    )
+    credential_header: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="Authorization"
+    )
+    authorization_server: Mapped[str | None] = mapped_column(String(2_000))
+    authorization_endpoint: Mapped[str | None] = mapped_column(String(2_000))
+    token_endpoint: Mapped[str | None] = mapped_column(String(2_000))
+    oauth_client_id: Mapped[str | None] = mapped_column(String(300))
+    oauth_client_secret_reference: Mapped[str | None] = mapped_column(String(300))
+    token_endpoint_auth_method: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="none"
+    )
+    redirect_uri: Mapped[str | None] = mapped_column(String(2_000))
+    required_scope: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    allowed_tools: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    tool_sets: Mapped[dict[str, list[str]]] = mapped_column(JSON, nullable=False, default=dict)
+    risk_level: Mapped[str] = mapped_column(String(30), nullable=False, default="low")
+    timeout_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=10.0)
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    circuit_breaker_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    circuit_breaker_recovery_seconds: Mapped[float] = mapped_column(
+        Float, nullable=False, default=30.0
+    )
+    response_size_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=1_000_000)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class CredentialReference(TimestampMixin, Base):
+    __tablename__ = "credential_references"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reference: Mapped[str] = mapped_column(String(300), nullable=False, unique=True)
+    vault_kind: Mapped[str] = mapped_column(String(50), nullable=False, default="memory")
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="active")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExternalConnection(TimestampMixin, Base):
+    __tablename__ = "external_connections"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "server_id",
+            "owner_user_id",
+            "ownership",
+            name="uq_external_connections_owner",
+        ),
+        Index("ix_external_connections_org_user", "organization_id", "owner_user_id"),
+        Index("ix_external_connections_server", "server_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    server_id: Mapped[UUID] = mapped_column(
+        ForeignKey("mcp_server_definitions.id", ondelete="CASCADE"), nullable=False
+    )
+    owner_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    ownership: Mapped[ConnectionOwnership] = mapped_column(
+        Enum(
+            ConnectionOwnership,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+    )
+    status: Mapped[ConnectionStatus] = mapped_column(
+        Enum(
+            ConnectionStatus,
+            native_enum=False,
+            length=30,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=ConnectionStatus.PENDING,
+    )
+    external_issuer: Mapped[str | None] = mapped_column(String(500))
+    external_subject: Mapped[str | None] = mapped_column(String(500))
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    credential_reference: Mapped[str] = mapped_column(String(300), nullable=False)
+    refresh_credential_reference: Mapped[str | None] = mapped_column(String(300))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    allowed_tools: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    allowed_tool_sets: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    connection_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, nullable=False, default=dict
+    )
+
+
+class ExternalAuthorizationGrant(Base):
+    __tablename__ = "external_authorization_grants"
+    __table_args__ = (UniqueConstraint("state_hash", name="uq_external_auth_grants_state"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    server_id: Mapped[UUID] = mapped_column(
+        ForeignKey("mcp_server_definitions.id", ondelete="CASCADE"), nullable=False
+    )
+    state_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    nonce_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ConnectionToolGrant(Base):
+    __tablename__ = "connection_tool_grants"
+    __table_args__ = (
+        UniqueConstraint("connection_id", "tool_name", name="uq_connection_tool_grant"),
+    )
+
+    connection_id: Mapped[UUID] = mapped_column(
+        ForeignKey("external_connections.id", ondelete="CASCADE"), primary_key=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(200), primary_key=True)
+    tool_set: Mapped[str | None] = mapped_column(String(100))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class AuditLog(Base):

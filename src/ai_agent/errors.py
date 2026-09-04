@@ -21,6 +21,18 @@ class McpConnectionError(AiAgentError):
     """Raised when an MCP server cannot be reached or negotiated safely."""
 
 
+class GatewayTimeoutError(AiAgentError):
+    """Raised when a Gateway call exceeds its deterministic timeout."""
+
+
+class RateLimitExceededError(AiAgentError):
+    """Raised when a Gateway rate limit is exceeded."""
+
+
+class CircuitOpenError(AiAgentError):
+    """Raised while an MCP Server circuit breaker is open."""
+
+
 class AuthorizationError(AiAgentError):
     """Raised when a platform permission or organization boundary denies access."""
 

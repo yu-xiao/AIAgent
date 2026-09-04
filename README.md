@@ -1,8 +1,8 @@
 # Enterprise AI Agent
 
-这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0 协议验证和 P1 Agent 平台骨架：独立 OIDC 会话、组织 RBAC、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、Run/SSE/取消、硬限制和追加式审计。
+这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0 协议验证、P1 Agent 平台骨架、P2 连接中心/MCP Gateway 和 P3 PermissionSystem 只读业务闭环：独立 OIDC 会话、组织 RBAC、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、Run/SSE/取消、硬限制、追加式审计、可信 MCP Server 注册、个人/组织连接、凭证引用、隔离 Tool Catalog、Gateway 策略控制、受控 Tool calling、Citation 和权限拒绝。
 
-P1 的模型供应商、模型名、Base URL 和 API Key 只从本地环境变量读取，不写入仓库。外部系统连接中心和 MCP Gateway 属于后续 P2。
+P1 的模型供应商、模型名、Base URL 和 API Key 只从本地环境变量读取，不写入仓库。P2 的 Token、Refresh Token 和 Client Secret 只进入 CredentialVault，不保存到数据库或普通日志。
 
 ## 快速开始
 
@@ -32,6 +32,8 @@ uv run --no-sync ai-agent check-config
 - `GET http://127.0.0.1:8000/health/ready`
 - `GET http://127.0.0.1:8000/api/v1/p0/status`
 - `GET http://127.0.0.1:8000/api/v1/p1/status`
+- `GET http://127.0.0.1:8000/api/v1/p2/status`
+- `GET http://127.0.0.1:8000/api/v1/p3/status`
 - `GET http://127.0.0.1:8000/metrics`
 - `GET http://127.0.0.1:8000/docs`
 
@@ -51,4 +53,4 @@ uv run --no-sync ai-agent probe-permission --call-list-datasets
 uv run --no-sync ai-agent probe-permission --skip-discovery
 ```
 
-详细范围、配置和验收方式见 [P0 验证说明](docs/p0-validation.md) 和 [P1 实施说明](docs/p1-validation.md)，总体设计见 [实施方案](docs/ai-agent-implementation-plan.md)。
+详细范围、配置和验收方式见 [P0 验证说明](docs/p0-validation.md)、[P1 实施说明](docs/p1-validation.md)、[P2 验证说明](docs/p2-validation.md) 和 [P3 验证说明](docs/p3-validation.md)，总体设计见 [实施方案](docs/ai-agent-implementation-plan.md)。启用 P2/P3 时设置 `AI_AGENT_MCP_GATEWAY__ENABLED=true`，并使用管理员身份注册经过审核的 PermissionSystem MCP Server；用户连接和 Tool Catalog 不接受任意 URL。

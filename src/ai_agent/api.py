@@ -1,4 +1,4 @@
-"""FastAPI application for P0 protocol probes and the P1 Agent platform."""
+"""FastAPI application for P0 through P3 Agent platform capabilities."""
 
 from __future__ import annotations
 
@@ -14,17 +14,25 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ai_agent.audit.api import router as audit_router
 from ai_agent.config import Settings
+from ai_agent.connections.api import router as connection_router
 from ai_agent.conversations.api import router as conversation_router
 from ai_agent.errors import (
     AiAgentError,
     AuthenticationError,
     AuthorizationError,
+    CircuitOpenError,
     ConflictError,
+    GatewayTimeoutError,
+    McpConnectionError,
     ModelProviderError,
+    ProtocolValidationError,
+    RateLimitExceededError,
     ResourceNotFoundError,
     RunLimitError,
 )
 from ai_agent.identity.api import router as identity_router
+from ai_agent.mcp.api import router as mcp_router
+from ai_agent.permission_system.api import router as permission_system_router
 from ai_agent.runtime import AppServices, build_services
 
 
@@ -45,14 +53,20 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     app = FastAPI(
         title=runtime_settings.app_name,
         version="0.2.0",
-        description="P1 independent identity, RBAC and observable single-Agent Run service.",
+        description=(
+            "Independent identity, RBAC, connections, policy-enforced MCP Gateway and "
+            "PermissionSystem read-only business closure."
+        ),
         lifespan=lifespan,
     )
     app.state.settings = runtime_settings
     app.state.services = services
     app.include_router(identity_router)
     app.include_router(conversation_router)
+    app.include_router(connection_router)
+    app.include_router(mcp_router)
     app.include_router(audit_router)
+    app.include_router(permission_system_router)
 
     @app.middleware("http")
     async def trace_request(
@@ -92,6 +106,26 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     @app.exception_handler(ModelProviderError)
     async def model_error(_: Request, exc: ModelProviderError) -> JSONResponse:
         return _error_response(status.HTTP_502_BAD_GATEWAY, "model_provider_error", str(exc))
+
+    @app.exception_handler(McpConnectionError)
+    async def mcp_connection_error(_: Request, exc: McpConnectionError) -> JSONResponse:
+        return _error_response(status.HTTP_502_BAD_GATEWAY, "mcp_connection_error", str(exc))
+
+    @app.exception_handler(ProtocolValidationError)
+    async def protocol_error(_: Request, exc: ProtocolValidationError) -> JSONResponse:
+        return _error_response(status.HTTP_502_BAD_GATEWAY, "mcp_protocol_error", str(exc))
+
+    @app.exception_handler(GatewayTimeoutError)
+    async def gateway_timeout(_: Request, exc: GatewayTimeoutError) -> JSONResponse:
+        return _error_response(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_timeout", str(exc))
+
+    @app.exception_handler(RateLimitExceededError)
+    async def gateway_rate_limit(_: Request, exc: RateLimitExceededError) -> JSONResponse:
+        return _error_response(status.HTTP_429_TOO_MANY_REQUESTS, "mcp_rate_limited", str(exc))
+
+    @app.exception_handler(CircuitOpenError)
+    async def gateway_circuit(_: Request, exc: CircuitOpenError) -> JSONResponse:
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "mcp_circuit_open", str(exc))
 
     @app.get("/health/live", tags=["health"])
     async def live() -> dict[str, str]:
@@ -160,6 +194,41 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
                 "audit": True,
                 "hard_limits": True,
             },
+        }
+
+    @app.get("/api/v1/p2/status", tags=["p2"])
+    async def p2_status() -> dict[str, object]:
+        return {
+            "phase": "P2",
+            "enabled": runtime_settings.mcp_gateway.enabled,
+            "capabilities": {
+                "trusted_mcp_server_registry": True,
+                "personal_oauth_connections": True,
+                "organization_connections": True,
+                "credential_references": True,
+                "tool_catalog_isolation": True,
+                "mcp_gateway": True,
+                "schema_validation": True,
+                "rate_limit_timeout_circuit_breaker": True,
+                "trace_and_tool_audit": True,
+            },
+        }
+
+    @app.get("/api/v1/p3/status", tags=["p3"])
+    async def p3_status() -> dict[str, object]:
+        permission = runtime_settings.permission_system
+        return {
+            "phase": "P3",
+            "enabled": permission.enabled and runtime_settings.mcp_gateway.enabled,
+            "capabilities": {
+                "permission_system_personal_connection": True,
+                "readonly_tool_allowlist": True,
+                "permission_denial_fail_closed": True,
+                "run_tool_calling": True,
+                "citation_persistence": True,
+                "golden_question_evaluation": True,
+            },
+            "expected_tools": list(permission.expected_tools),
         }
 
     return app

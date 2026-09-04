@@ -105,6 +105,20 @@ async def test_csrf_global_switch_and_question_limit(platform_runtime: PlatformR
     assert disabled.status_code == 503
 
 
+async def test_p3_status_exposes_readonly_closure(platform_runtime: PlatformRuntime) -> None:
+    runtime = platform_runtime
+    runtime.settings.permission_system.enabled = True
+    runtime.settings.mcp_gateway.enabled = True
+
+    response = await runtime.client.get("/api/v1/p3/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "P3"
+    assert payload["enabled"] is True
+    assert "query_dataset" in payload["expected_tools"]
+
+
 async def test_run_can_be_cancelled(platform_runtime: PlatformRuntime) -> None:
     runtime = platform_runtime
     runtime.provider.gate = asyncio.Event()

@@ -59,6 +59,18 @@ class ConversationDetail(ConversationView):
     messages: list[MessageView]
 
 
+class CitationView(BaseModel):
+    id: UUID
+    source_system: str
+    server_code: str
+    tool_name: str
+    resource_id: str | None
+    queried_at: datetime
+    trace_id: UUID
+    partial: bool
+    created_at: datetime
+
+
 class RunView(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -71,6 +83,19 @@ class RunView(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     events_url: str
+    citations: list[CitationView] = Field(default_factory=list)
+
+
+class ToolInvocationView(BaseModel):
+    id: UUID
+    server_code: str
+    tool_name: str
+    status: str
+    arguments_digest: str
+    duration_ms: float | None
+    error: str | None
+    trace_id: UUID
+    created_at: datetime
 
 
 @router.get("/conversations", response_model=list[ConversationView], tags=["conversations"])
@@ -191,7 +216,10 @@ async def get_run(
     run = await request.app.state.services.conversations.get_run(
         identity.session.user_id, organization_id, run_id
     )
-    return _run_view(run)
+    citations = await request.app.state.services.conversations.list_run_citations(
+        identity.session.user_id, organization_id, run_id
+    )
+    return _run_view(run, citations)
 
 
 @router.post("/runs/{run_id}/cancel", response_model=RunView, tags=["runs"])
@@ -213,6 +241,36 @@ async def cancel_run(
             {"trace_id": str(run.trace_id)},
         )
     return _run_view(run)
+
+
+@router.get("/runs/{run_id}/citations", response_model=list[CitationView], tags=["runs"])
+async def list_run_citations(
+    run_id: UUID,
+    request: Request,
+    identity: CurrentIdentity,
+    organization_id: OrganizationId,
+) -> list[CitationView]:
+    citations = await request.app.state.services.conversations.list_run_citations(
+        identity.session.user_id, organization_id, run_id
+    )
+    return [CitationView.model_validate(item) for item in citations]
+
+
+@router.get(
+    "/runs/{run_id}/tool-invocations",
+    response_model=list[ToolInvocationView],
+    tags=["runs"],
+)
+async def list_run_tool_invocations(
+    run_id: UUID,
+    request: Request,
+    identity: CurrentIdentity,
+    organization_id: OrganizationId,
+) -> list[ToolInvocationView]:
+    invocations = await request.app.state.services.conversations.list_run_tool_invocations(
+        identity.session.user_id, organization_id, run_id
+    )
+    return [ToolInvocationView.model_validate(item) for item in invocations]
 
 
 @router.get("/runs/{run_id}/events", tags=["runs"])
@@ -298,7 +356,7 @@ def _message_view(item: Message) -> MessageView:
     )
 
 
-def _run_view(run: Run) -> RunView:
+def _run_view(run: Run, citations: list[object] | None = None) -> RunView:
     return RunView(
         id=run.id,
         conversation_id=run.conversation_id,
@@ -311,4 +369,5 @@ def _run_view(run: Run) -> RunView:
         started_at=run.started_at,
         completed_at=run.completed_at,
         events_url=f"/api/v1/runs/{run.id}/events",
+        citations=[CitationView.model_validate(item) for item in citations or []],
     )

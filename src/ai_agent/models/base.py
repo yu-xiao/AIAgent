@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCall:
+    """A provider-neutral request for one MCP tool invocation."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
 class ModelMessage:
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str
+    tool_call_id: str | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +34,7 @@ class ModelUsageResult:
 class ModelStreamEvent:
     delta: str | None = None
     usage: ModelUsageResult | None = None
+    tool_calls: tuple[ModelToolCall, ...] = ()
 
 
 class ModelProvider(Protocol):
@@ -40,4 +52,5 @@ class ModelProvider(Protocol):
         *,
         max_output_tokens: int,
         trace_id: str,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[ModelStreamEvent]: ...

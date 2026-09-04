@@ -11,8 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ai_agent.config import RunLimitSettings
 from ai_agent.errors import ConflictError, ResourceNotFoundError, RunLimitError
 from ai_agent.identity.service import AGENT_USE, IdentityService
+from ai_agent.mcp.models import Citation as CitationValue
+from ai_agent.mcp.models import ToolInvocationRecord
 from ai_agent.persistence.models import (
     AuditLog,
+    Citation,
     Conversation,
     Message,
     MessageRole,
@@ -20,6 +23,7 @@ from ai_agent.persistence.models import (
     Run,
     RunStatus,
     RunStep,
+    ToolInvocation,
 )
 
 TERMINAL_RUN_STATUSES = {
@@ -271,11 +275,13 @@ class ConversationService:
         input_tokens: int,
         output_tokens: int,
         cost_usd: float,
-    ) -> None:
+        citations: list[CitationValue] | None = None,
+        tool_invocations: list[ToolInvocationRecord] | None = None,
+    ) -> bool:
         async with self._session_factory() as session, session.begin():
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
             if run is None or run.status != RunStatus.RUNNING:
-                return
+                return False
             now = datetime.now(UTC)
             message = Message(
                 organization_id=run.organization_id,
@@ -294,6 +300,35 @@ class ConversationService:
             if step:
                 step.status = "completed"
                 step.completed_at = now
+            for invocation in tool_invocations or []:
+                session.add(
+                    ToolInvocation(
+                        run_id=run.id,
+                        organization_id=run.organization_id,
+                        user_id=run.user_id,
+                        server_code=invocation.server_code,
+                        tool_name=invocation.tool_name,
+                        status=invocation.status,
+                        arguments_digest=invocation.arguments_digest,
+                        duration_ms=invocation.duration_ms,
+                        error=invocation.error,
+                        trace_id=run.trace_id,
+                    )
+                )
+            for citation in _deduplicate_citations(citations or []):
+                session.add(
+                    Citation(
+                        run_id=run.id,
+                        organization_id=run.organization_id,
+                        source_system=citation.source_system,
+                        server_code=citation.server_code,
+                        tool_name=citation.tool_name,
+                        resource_id=citation.resource_id,
+                        queried_at=citation.queried_at,
+                        trace_id=run.trace_id,
+                        partial=citation.partial,
+                    )
+                )
             session.add(
                 ModelUsage(
                     run_id=run.id,
@@ -316,7 +351,60 @@ class ConversationService:
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "cost_usd": cost_usd,
+                        "tool_calls": len(tool_invocations or []),
+                        "citations": len(_deduplicate_citations(citations or [])),
                     },
+                )
+            )
+            return True
+
+    async def list_run_citations(
+        self, user_id: UUID, organization_id: UUID, run_id: UUID
+    ) -> list[Citation]:
+        await self._identities.access(user_id, organization_id, AGENT_USE)
+        async with self._session_factory() as session:
+            run = await session.scalar(
+                select(Run.id).where(
+                    Run.id == run_id,
+                    Run.organization_id == organization_id,
+                    Run.user_id == user_id,
+                )
+            )
+            if run is None:
+                raise ResourceNotFoundError("Run not found.")
+            return list(
+                await session.scalars(
+                    select(Citation)
+                    .where(
+                        Citation.run_id == run_id,
+                        Citation.organization_id == organization_id,
+                    )
+                    .order_by(Citation.created_at, Citation.id)
+                )
+            )
+
+    async def list_run_tool_invocations(
+        self, user_id: UUID, organization_id: UUID, run_id: UUID
+    ) -> list[ToolInvocation]:
+        await self._identities.access(user_id, organization_id, AGENT_USE)
+        async with self._session_factory() as session:
+            run = await session.scalar(
+                select(Run.id).where(
+                    Run.id == run_id,
+                    Run.organization_id == organization_id,
+                    Run.user_id == user_id,
+                )
+            )
+            if run is None:
+                raise ResourceNotFoundError("Run not found.")
+            return list(
+                await session.scalars(
+                    select(ToolInvocation)
+                    .where(
+                        ToolInvocation.run_id == run_id,
+                        ToolInvocation.organization_id == organization_id,
+                    )
+                    .order_by(ToolInvocation.created_at, ToolInvocation.id)
                 )
             )
 
@@ -349,3 +437,20 @@ class ConversationService:
                     details={"error_code": error_code},
                 )
             )
+
+
+def _deduplicate_citations(items: list[CitationValue]) -> list[CitationValue]:
+    seen: set[tuple[str, str, str, str, bool]] = set()
+    result: list[CitationValue] = []
+    for item in items:
+        key = (
+            item.source_system,
+            item.server_code,
+            item.tool_name,
+            item.trace_id,
+            item.partial,
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
