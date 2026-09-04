@@ -38,10 +38,12 @@ def do_run_migrations(connection: object) -> None:
 
 
 async def run_async_migrations() -> None:
+    password = settings.database_password()
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"password": password} if password else {},
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

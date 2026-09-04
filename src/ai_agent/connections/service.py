@@ -177,6 +177,7 @@ class ConnectionService:
             )
             credential = _credential_from_token(token)
             access_reference = await self._vault.put(credential)
+            reference_to_revoke: str | None = None
             previous = await session.scalar(
                 select(ExternalConnection)
                 .where(
@@ -192,7 +193,7 @@ class ConnectionService:
                     CredentialReference(
                         organization_id=grant.organization_id,
                         reference=access_reference,
-                        vault_kind="memory",
+                        vault_kind=self._vault.kind,
                         expires_at=credential.expires_at,
                     )
                 )
@@ -212,19 +213,19 @@ class ConnectionService:
                 await session.flush()
             else:
                 connection = previous
-                await self._vault.revoke(previous.credential_reference)
+                reference_to_revoke = previous.credential_reference
                 old_reference = await session.scalar(
                     select(CredentialReference).where(
                         CredentialReference.reference == previous.credential_reference
                     )
                 )
                 if old_reference:
-                    old_reference.status = "revoked"
+                    old_reference.status = "revocation_pending"
                 session.add(
                     CredentialReference(
                         organization_id=grant.organization_id,
                         reference=access_reference,
-                        vault_kind="memory",
+                        vault_kind=self._vault.kind,
                         expires_at=credential.expires_at,
                     )
                 )
@@ -245,7 +246,10 @@ class ConnectionService:
                     details={"server_code": server.code, "scope": _scopes(token, server)},
                 )
             )
-            return connection
+        if reference_to_revoke is not None:
+            await self._vault.revoke(reference_to_revoke)
+            await self._mark_reference_revoked(reference_to_revoke)
+        return connection
 
     async def create_organization_connection(
         self,
@@ -295,6 +299,7 @@ class ConnectionService:
             expires_at=expires_at,
         )
         reference = await self._vault.put(credential)
+        reference_to_revoke: str | None = None
         async with self._session_factory() as session, session.begin():
             existing = await session.scalar(
                 select(ExternalConnection)
@@ -306,20 +311,21 @@ class ConnectionService:
                 )
                 .with_for_update()
             )
+            rotated = existing is not None
             if existing:
-                await self._vault.revoke(existing.credential_reference)
+                reference_to_revoke = existing.credential_reference
                 old_reference = await session.scalar(
                     select(CredentialReference).where(
                         CredentialReference.reference == existing.credential_reference
                     )
                 )
                 if old_reference:
-                    old_reference.status = "revoked"
+                    old_reference.status = "revocation_pending"
                 session.add(
                     CredentialReference(
                         organization_id=organization_id,
                         reference=reference,
-                        vault_kind="memory",
+                        vault_kind=self._vault.kind,
                         expires_at=expires_at,
                     )
                 )
@@ -333,7 +339,7 @@ class ConnectionService:
                     CredentialReference(
                         organization_id=organization_id,
                         reference=reference,
-                        vault_kind="memory",
+                        vault_kind=self._vault.kind,
                         expires_at=expires_at,
                     )
                 )
@@ -356,14 +362,21 @@ class ConnectionService:
                 AuditLog(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
-                    action="connection.organization_created",
+                    action=(
+                        "connection.credential_rotated"
+                        if rotated
+                        else "connection.organization_created"
+                    ),
                     resource_type="external_connection",
                     resource_id=str(connection.id),
                     trace_id=trace_id,
                     details={"server_code": server.code, "allowed_tools": connection.allowed_tools},
                 )
             )
-            return connection
+        if reference_to_revoke is not None:
+            await self._vault.revoke(reference_to_revoke)
+            await self._mark_reference_revoked(reference_to_revoke)
+        return connection
 
     async def list_connections(
         self, user_id: UUID, organization_id: UUID
@@ -391,6 +404,7 @@ class ConnectionService:
         trace_id: UUID | None = None,
     ) -> None:
         await self._identities.access(user_id, organization_id, CONNECTION_PERSONAL_DISCONNECT)
+        reference_to_revoke: str | None = None
         async with self._session_factory() as session, session.begin():
             connection = await session.scalar(
                 select(ExternalConnection)
@@ -410,14 +424,14 @@ class ConnectionService:
                     user_id, organization_id, CONNECTION_ORGANIZATION_MANAGE
                 )
             connection.status = ConnectionStatus.DISCONNECTED
-            await self._vault.revoke(connection.credential_reference)
+            reference_to_revoke = connection.credential_reference
             credential_reference = await session.scalar(
                 select(CredentialReference).where(
                     CredentialReference.reference == connection.credential_reference
                 )
             )
             if credential_reference:
-                credential_reference.status = "revoked"
+                credential_reference.status = "revocation_pending"
             session.add(
                 AuditLog(
                     organization_id=organization_id,
@@ -429,6 +443,9 @@ class ConnectionService:
                     details={},
                 )
             )
+        if reference_to_revoke is not None:
+            await self._vault.revoke(reference_to_revoke)
+            await self._mark_reference_revoked(reference_to_revoke)
 
     async def refresh_connection(
         self,
@@ -477,16 +494,16 @@ class ConnectionService:
                 )
             )
             if old_reference:
-                old_reference.status = "revoked"
+                old_reference.status = "revocation_pending"
             session.add(
                 CredentialReference(
                     organization_id=organization_id,
                     reference=reference,
-                    vault_kind="memory",
+                    vault_kind=self._vault.kind,
                     expires_at=credential.expires_at,
                 )
             )
-            await self._vault.revoke(connection.credential_reference)
+            reference_to_revoke = connection.credential_reference
             connection.credential_reference = reference
             connection.expires_at = credential.expires_at
             connection.status = ConnectionStatus.ACTIVE
@@ -501,7 +518,17 @@ class ConnectionService:
                     details={"server_code": server.code},
                 )
             )
-            return connection
+        await self._vault.revoke(reference_to_revoke)
+        await self._mark_reference_revoked(reference_to_revoke)
+        return connection
+
+    async def _mark_reference_revoked(self, reference: str) -> None:
+        async with self._session_factory() as session, session.begin():
+            stored = await session.scalar(
+                select(CredentialReference).where(CredentialReference.reference == reference)
+            )
+            if stored is not None:
+                stored.status = "revoked"
 
     async def get_usable_connection(
         self, user_id: UUID, organization_id: UUID, server_id: UUID

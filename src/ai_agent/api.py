@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
@@ -11,9 +12,10 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ai_agent.audit.api import router as audit_router
-from ai_agent.config import Settings
+from ai_agent.config import Environment, Settings
 from ai_agent.connections.api import router as connection_router
 from ai_agent.conversations.api import router as conversation_router
 from ai_agent.errors import (
@@ -26,19 +28,64 @@ from ai_agent.errors import (
     McpConnectionError,
     ModelProviderError,
     ProtocolValidationError,
+    QuotaExceededError,
     RateLimitExceededError,
     ResourceNotFoundError,
     RunLimitError,
 )
 from ai_agent.identity.api import router as identity_router
 from ai_agent.mcp.api import router as mcp_router
+from ai_agent.observability.metrics import HTTP_DURATION, HTTP_IN_PROGRESS, HTTP_REQUESTS
+from ai_agent.observability.tracing import configure_tracing
 from ai_agent.permission_system.api import router as permission_system_router
 from ai_agent.runtime import AppServices, build_services
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        received = 0
+        messages: list[Message] = []
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self._max_bytes:
+                    response = _error_response(
+                        status.HTTP_413_CONTENT_TOO_LARGE,
+                        "request_too_large",
+                        "Request body exceeds the configured size limit.",
+                    )
+                    await response(scope, receive, send)
+                    return
+                if not message.get("more_body", False):
+                    break
+            elif message["type"] == "http.disconnect":
+                break
+        position = 0
+
+        async def replay_receive() -> Message:
+            nonlocal position
+            if position < len(messages):
+                message = messages[position]
+                position += 1
+                return message
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
 
 
 def create_app(settings: Settings | None = None, services: AppServices | None = None) -> FastAPI:
     runtime_settings = settings or Settings()
     owns_services = services is None
+    tracing = configure_tracing(runtime_settings.observability)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -46,18 +93,27 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
             runtime_settings.validate_runtime()
             if app.state.services is None:
                 app.state.services = build_services(runtime_settings)
-        yield
-        if owns_services and app.state.services is not None:
-            await app.state.services.close()
+                await app.state.services.start(runtime_settings)
+        try:
+            yield
+        finally:
+            if owns_services and app.state.services is not None:
+                await app.state.services.close()
+            tracing.close()
 
     app = FastAPI(
         title=runtime_settings.app_name,
-        version="0.2.0",
+        version="0.3.0",
         description=(
             "Independent identity, RBAC, connections, policy-enforced MCP Gateway and "
             "PermissionSystem read-only business closure."
         ),
         lifespan=lifespan,
+    )
+    tracing.instrument(app)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=runtime_settings.governance.max_request_body_bytes,
     )
     app.state.settings = runtime_settings
     app.state.services = services
@@ -73,15 +129,59 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        started = time.monotonic()
+        HTTP_IN_PROGRESS.inc()
         incoming = request.headers.get("X-Trace-Id")
         try:
             trace_id = str(UUID(incoming)) if incoming else str(uuid4())
         except ValueError:
             trace_id = str(uuid4())
         request.state.trace_id = UUID(trace_id)
-        response = await call_next(request)
-        response.headers["X-Trace-Id"] = trace_id
-        return response
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        response: Response
+        try:
+            content_length = request.headers.get("Content-Length")
+            try:
+                declared_length = int(content_length) if content_length is not None else None
+            except ValueError:
+                response = _error_response(
+                    status.HTTP_400_BAD_REQUEST,
+                    "invalid_content_length",
+                    "Content-Length header is invalid.",
+                )
+            else:
+                oversized = (
+                    declared_length is not None
+                    and declared_length > runtime_settings.governance.max_request_body_bytes
+                )
+                if oversized:
+                    response = _error_response(
+                        status.HTTP_413_CONTENT_TOO_LARGE,
+                        "request_too_large",
+                        "Request body exceeds the configured size limit.",
+                    )
+                else:
+                    response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Trace-Id"] = trace_id
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+            if runtime_settings.environment == Environment.PRODUCTION:
+                response.headers["Strict-Transport-Security"] = "max-age=31536000"
+            return response
+        finally:
+            route = getattr(request.scope.get("route"), "path", "unmatched")
+            HTTP_REQUESTS.labels(
+                method=request.method,
+                route=route,
+                status=str(status_code),
+            ).inc()
+            HTTP_DURATION.labels(method=request.method, route=route).observe(
+                time.monotonic() - started
+            )
+            HTTP_IN_PROGRESS.dec()
 
     @app.exception_handler(AuthenticationError)
     async def authentication_error(_: Request, exc: AuthenticationError) -> JSONResponse:
@@ -123,6 +223,10 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     async def gateway_rate_limit(_: Request, exc: RateLimitExceededError) -> JSONResponse:
         return _error_response(status.HTTP_429_TOO_MANY_REQUESTS, "mcp_rate_limited", str(exc))
 
+    @app.exception_handler(QuotaExceededError)
+    async def run_quota_error(_: Request, exc: QuotaExceededError) -> JSONResponse:
+        return _error_response(status.HTTP_429_TOO_MANY_REQUESTS, "run_quota_exceeded", str(exc))
+
     @app.exception_handler(CircuitOpenError)
     async def gateway_circuit(_: Request, exc: CircuitOpenError) -> JSONResponse:
         return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "mcp_circuit_open", str(exc))
@@ -135,7 +239,10 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     async def ready() -> JSONResponse:
         try:
             runtime_settings.validate_runtime(
-                require_permission_token=runtime_settings.permission_system.enabled
+                require_permission_token=(
+                    runtime_settings.permission_system.enabled
+                    and not runtime_settings.platform.enabled
+                )
             )
             if runtime_settings.platform.enabled:
                 if app.state.services is None:
@@ -229,6 +336,29 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
                 "golden_question_evaluation": True,
             },
             "expected_tools": list(permission.expected_tools),
+        }
+
+    @app.get("/api/v1/p5/status", tags=["p5"])
+    async def p5_status() -> dict[str, object]:
+        governance = runtime_settings.governance
+        runs_enabled = runtime_settings.platform.runs_enabled
+        if app.state.services is not None and app.state.services.quota is not None:
+            runs_enabled = runs_enabled and await app.state.services.quota.runs_enabled()
+        return {
+            "phase": "P5",
+            "enabled": governance.enabled,
+            "runs_enabled": runs_enabled,
+            "capabilities": {
+                "distributed_quotas": governance.quota.enabled,
+                "durable_credential_vault": runtime_settings.credentials.backend.value
+                == "hashicorp_vault",
+                "distributed_mcp_policies": True,
+                "graceful_shutdown_and_recovery": True,
+                "prometheus_metrics_and_alerts": True,
+                "optional_otlp_tracing": runtime_settings.observability.tracing_enabled,
+                "audit_retention": True,
+            },
+            "audit_retention_days": governance.audit_retention_days,
         }
 
     return app

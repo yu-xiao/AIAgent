@@ -1,0 +1,72 @@
+groups:
+  - name: ai-agent
+    rules:
+      - alert: AiAgentApiDown
+        expr: up{job=~"ai-agent-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: AI Agent API is unavailable
+
+      - alert: AiAgentRunFailureRateHigh
+        expr: |
+          sum(rate(ai_agent_runs_total{status=~"failed|timed_out"}[10m]))
+          / clamp_min(sum(rate(ai_agent_runs_total[10m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Agent Run failure rate exceeds 5 percent
+
+      - alert: AiAgentMcpFailureRateHigh
+        expr: |
+          sum(rate(ai_agent_mcp_tool_calls_total{status=~"failed|timeout"}[10m]))
+          / clamp_min(sum(rate(ai_agent_mcp_tool_calls_total[10m])), 0.001) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: MCP failure rate exceeds 10 percent
+
+      - alert: AiAgentHttpP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(ai_agent_http_request_duration_seconds_bucket[10m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Platform HTTP P95 exceeds 500 milliseconds
+
+      - alert: AiAgentQuotaRejected
+        expr: increase(ai_agent_quota_rejections_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more Run quotas rejected work
+
+      - alert: AiAgentVaultFailures
+        expr: increase(ai_agent_vault_operations_total{status="failed"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Credential Vault operations are failing
+
+      - alert: AiAgentAuditWriteFailure
+        expr: increase(ai_agent_audit_write_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Audit records could not be persisted
+
+      - alert: AiAgentHourlyModelCostHigh
+        expr: increase(ai_agent_model_cost_usd_total[1h]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Model cost exceeded 10 USD during one hour

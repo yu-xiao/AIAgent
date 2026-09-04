@@ -45,6 +45,53 @@ class ConversationService:
         self._identities = identities
         self._limits = limits
 
+    async def recover_incomplete_runs(self, stale_before: datetime) -> list[Run]:
+        """Fail abandoned running work and return durable queued work for resubmission."""
+
+        async with self._session_factory() as session, session.begin():
+            stale = list(
+                await session.scalars(
+                    select(Run)
+                    .where(
+                        Run.status == RunStatus.RUNNING,
+                        Run.started_at.is_not(None),
+                        Run.started_at < stale_before,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            now = datetime.now(UTC)
+            for run in stale:
+                run.status = RunStatus.FAILED
+                run.error_code = "stale_run_recovered"
+                run.error_message = "Run was interrupted before completion."
+                run.completed_at = now
+                step = await session.scalar(
+                    select(RunStep).where(RunStep.run_id == run.id, RunStep.sequence == 1)
+                )
+                if step is not None:
+                    step.status = RunStatus.FAILED.value
+                    step.completed_at = now
+                session.add(
+                    AuditLog(
+                        organization_id=run.organization_id,
+                        actor_user_id=run.user_id,
+                        action="run.recovered_as_failed",
+                        resource_type="run",
+                        resource_id=str(run.id),
+                        trace_id=run.trace_id,
+                        details={"error_code": "stale_run_recovered"},
+                    )
+                )
+            queued = list(
+                await session.scalars(
+                    select(Run)
+                    .where(Run.status == RunStatus.QUEUED)
+                    .order_by(Run.created_at, Run.id)
+                )
+            )
+            return queued
+
     async def create_conversation(
         self, user_id: UUID, organization_id: UUID, title: str
     ) -> Conversation:
@@ -409,7 +456,17 @@ class ConversationService:
             )
 
     async def finish_run_with_error(
-        self, run_id: UUID, status: RunStatus, error_code: str, public_message: str
+        self,
+        run_id: UUID,
+        status: RunStatus,
+        error_code: str,
+        public_message: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         async with self._session_factory() as session, session.begin():
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
@@ -426,6 +483,29 @@ class ConversationService:
             if step:
                 step.status = status.value
                 step.completed_at = now
+            usage_details: dict[str, int | float] = {}
+            if (
+                provider is not None
+                and model is not None
+                and input_tokens is not None
+                and output_tokens is not None
+                and cost_usd is not None
+            ):
+                session.add(
+                    ModelUsage(
+                        run_id=run.id,
+                        provider=provider,
+                        model=model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_usd=cost_usd,
+                    )
+                )
+                usage_details = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cost_usd": cost_usd,
+                }
             session.add(
                 AuditLog(
                     organization_id=run.organization_id,
@@ -434,7 +514,7 @@ class ConversationService:
                     resource_type="run",
                     resource_id=str(run.id),
                     trace_id=run.trace_id,
-                    details={"error_code": error_code},
+                    details={"error_code": error_code, **usage_details},
                 )
             )
 

@@ -7,10 +7,12 @@ import hashlib
 import json
 import time
 from collections import defaultdict, deque
+from collections.abc import Awaitable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from mcp.types import CallToolResult
+from redis.asyncio import Redis
 
 from ai_agent.errors import (
     AuthorizationError,
@@ -22,6 +24,8 @@ from ai_agent.errors import (
 )
 from ai_agent.mcp.models import Citation, RunContext, ToolDefinition, ToolResult
 from ai_agent.mcp.tool_catalog import ResolvedTool, ToolCatalogService
+from ai_agent.observability.metrics import AUDIT_WRITE_FAILURES, MCP_CALLS, MCP_DURATION
+from ai_agent.observability.tracing import operation_span
 
 
 class SlidingWindowRateLimiter:
@@ -66,13 +70,86 @@ class CircuitBreaker:
                 self._opened_until[key] = time.monotonic() + recovery_seconds
 
 
+class RedisSlidingWindowRateLimiter:
+    """Sliding-window limiter shared by all API instances."""
+
+    _SCRIPT = """
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
+    if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+    return 1
+    """
+
+    def __init__(self, redis: Redis, prefix: str = "ai-agent:mcp:rate") -> None:
+        self._redis = redis
+        self._prefix = prefix
+
+    async def check(self, key: str, limit: int, *, window_seconds: float = 60.0) -> None:
+        now_ms = int(time.time() * 1_000)
+        member = f"{now_ms}:{time.monotonic_ns()}"
+        allowed = await _redis_eval(
+            self._redis,
+            self._SCRIPT,
+            1,
+            f"{self._prefix}:{key}",
+            now_ms,
+            max(round(window_seconds * 1_000), 1),
+            limit,
+            member,
+        )
+        if not bool(allowed):
+            raise RateLimitExceededError("MCP Tool rate limit exceeded.")
+
+
+class RedisCircuitBreaker:
+    """Failure threshold and open state shared by all API instances."""
+
+    _FAILURE_SCRIPT = """
+    local failures = redis.call('INCR', KEYS[1])
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    if failures >= tonumber(ARGV[2]) then
+      redis.call('SET', KEYS[2], '1', 'PX', ARGV[1])
+    end
+    return failures
+    """
+
+    def __init__(self, redis: Redis, prefix: str = "ai-agent:mcp:circuit") -> None:
+        self._redis = redis
+        self._prefix = prefix
+
+    async def before(self, key: str) -> None:
+        if await self._redis.exists(self._open_key(key)):
+            raise CircuitOpenError("MCP Server circuit breaker is open.")
+
+    async def success(self, key: str) -> None:
+        await self._redis.delete(self._failure_key(key), self._open_key(key))
+
+    async def failure(self, key: str, threshold: int, recovery_seconds: float) -> None:
+        await _redis_eval(
+            self._redis,
+            self._FAILURE_SCRIPT,
+            2,
+            self._failure_key(key),
+            self._open_key(key),
+            max(round(recovery_seconds * 1_000), 1),
+            threshold,
+        )
+
+    def _failure_key(self, key: str) -> str:
+        return f"{self._prefix}:failures:{key}"
+
+    def _open_key(self, key: str) -> str:
+        return f"{self._prefix}:open:{key}"
+
+
 class McpGateway:
     def __init__(
         self,
         catalog: ToolCatalogService,
         *,
-        rate_limiter: SlidingWindowRateLimiter | None = None,
-        circuit_breaker: CircuitBreaker | None = None,
+        rate_limiter: SlidingWindowRateLimiter | RedisSlidingWindowRateLimiter | None = None,
+        circuit_breaker: CircuitBreaker | RedisCircuitBreaker | None = None,
         audit: Any | None = None,
     ) -> None:
         self._catalog = catalog
@@ -104,18 +181,18 @@ class McpGateway:
         if context.has_expired():
             raise GatewayTimeoutError("MCP Tool request deadline has expired.")
         resolved = await self._catalog.resolve_tool(context, tool_name, system_code, personal_only)
-        self._validate_input(resolved.definition, arguments)
         key = f"{context.organization_id}:{resolved.server.id}"
-        await self._rate_limiter.check(
-            f"{key}:{context.user_id}", resolved.server.rate_limit_per_minute
-        )
-        await self._circuit_breaker.before(key)
-        if self._semaphore_limits.get(key) != resolved.server.max_concurrency:
-            self._semaphores[key] = asyncio.Semaphore(resolved.server.max_concurrency)
-            self._semaphore_limits[key] = resolved.server.max_concurrency
-        semaphore = self._semaphores[key]
         started = time.monotonic()
         try:
+            self._validate_input(resolved.definition, arguments)
+            await self._rate_limiter.check(
+                f"{key}:{context.user_id}", resolved.server.rate_limit_per_minute
+            )
+            await self._circuit_breaker.before(key)
+            if self._semaphore_limits.get(key) != resolved.server.max_concurrency:
+                self._semaphores[key] = asyncio.Semaphore(resolved.server.max_concurrency)
+                self._semaphore_limits[key] = resolved.server.max_concurrency
+            semaphore = self._semaphores[key]
             async with semaphore:
                 client = self._catalog.client_for(resolved, context)
                 timeout = resolved.server.timeout_seconds
@@ -124,7 +201,15 @@ class McpGateway:
                         timeout, max((context.deadline - datetime.now(UTC)).total_seconds(), 0.001)
                     )
                 async with asyncio.timeout(timeout):
-                    raw = await client.call_tool(tool_name, arguments)
+                    with operation_span(
+                        "mcp.tool.call",
+                        trace_id=context.trace_id,
+                        attributes={
+                            "mcp.server": resolved.server.code,
+                            "mcp.tool": resolved.definition.name,
+                        },
+                    ):
+                        raw = await client.call_tool(tool_name, arguments)
             result = self._result(
                 resolved,
                 raw,
@@ -137,10 +222,13 @@ class McpGateway:
                 and result.is_error
                 and _is_permission_denial(result)
             ):
+                await self._circuit_breaker.success(key)
                 await self._write_audit(context, resolved, "rejected", started, "permission")
+                self._observe(resolved, "rejected", started)
                 raise AuthorizationError("PermissionSystem denied the requested data scope.")
             await self._circuit_breaker.success(key)
             await self._write_audit(context, resolved, "succeeded", started, None)
+            self._observe(resolved, "succeeded", started)
             return result
         except TimeoutError as exc:
             await self._circuit_breaker.failure(
@@ -149,9 +237,11 @@ class McpGateway:
                 resolved.server.circuit_breaker_recovery_seconds,
             )
             await self._write_audit(context, resolved, "timeout", started, "timeout")
+            self._observe(resolved, "timeout", started)
             raise GatewayTimeoutError("MCP Tool request timed out.") from exc
         except (ProtocolValidationError, RateLimitExceededError, CircuitOpenError):
             await self._write_audit(context, resolved, "rejected", started, "policy")
+            self._observe(resolved, "rejected", started)
             raise
         except AuthorizationError:
             raise
@@ -162,6 +252,7 @@ class McpGateway:
                 resolved.server.circuit_breaker_recovery_seconds,
             )
             await self._write_audit(context, resolved, "failed", started, "connection")
+            self._observe(resolved, "failed", started)
             if isinstance(exc, McpConnectionError):
                 raise
             raise McpConnectionError("MCP Tool call failed.") from exc
@@ -241,7 +332,12 @@ class McpGateway:
         except Exception:
             # Audit outages must be observable by operations, but must not turn a
             # completed business query into a second, misleading MCP failure.
-            return
+            AUDIT_WRITE_FAILURES.inc()
+
+    @staticmethod
+    def _observe(resolved: ResolvedTool, status: str, started: float) -> None:
+        MCP_CALLS.labels(server=resolved.server.code, status=status).inc()
+        MCP_DURATION.labels(server=resolved.server.code).observe(time.monotonic() - started)
 
 
 def _validate_json_schema(value: Any, schema: dict[str, Any], *, path: str) -> None:
@@ -337,6 +433,11 @@ def _resource_id(arguments: dict[str, Any]) -> str | None:
         if isinstance(value, (str, int)) and len(str(value)) <= 300:
             return str(value)
     return None
+
+
+async def _redis_eval(redis: Redis, script: str, key_count: int, *values: str | int | float) -> Any:
+    result = redis.eval(script, key_count, *values)
+    return await cast(Awaitable[Any], result)
 
 
 # Stable interface name used by the Agent orchestration layer.

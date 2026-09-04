@@ -4,19 +4,29 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from redis.asyncio import Redis
 
-from ai_agent.config import Settings
+from ai_agent.config import CredentialVaultBackend, Settings
 from ai_agent.connections.service import ConnectionService
 from ai_agent.conversations.service import ConversationService
-from ai_agent.credentials.vault import CredentialVault, MemoryCredentialVault
+from ai_agent.credentials.vault import (
+    CredentialVault,
+    HashicorpVaultCredentialVault,
+    MemoryCredentialVault,
+)
+from ai_agent.governance.quota import RedisRunQuota
 from ai_agent.identity.oidc import OidcLoginService
 from ai_agent.identity.service import IdentityService
 from ai_agent.identity.sessions import RedisSessionStore, SessionStore
-from ai_agent.mcp.gateway import McpGateway
+from ai_agent.mcp.gateway import (
+    McpGateway,
+    RedisCircuitBreaker,
+    RedisSlidingWindowRateLimiter,
+)
 from ai_agent.mcp.registry import McpServerRegistry
 from ai_agent.mcp.tool_catalog import RedisCatalogCache, ToolCatalogService
 from ai_agent.models import ModelProvider
@@ -40,6 +50,7 @@ class AppServices:
     control: RunControl
     executor: RunExecutor
     provider: ModelProvider
+    quota: RedisRunQuota | None = None
     vault: CredentialVault | None = None
     mcp_registry: McpServerRegistry | None = None
     connections: ConnectionService | None = None
@@ -50,17 +61,34 @@ class AppServices:
     async def ping(self) -> None:
         await self.database.ping()
         await self.sessions.ping()
+        if self.vault is not None:
+            await self.vault.ping()
+
+    async def start(self, settings: Settings) -> None:
+        queued = await self.conversations.recover_incomplete_runs(
+            datetime.now(UTC) - timedelta(seconds=settings.governance.stale_run_after_seconds)
+        )
+        for run in queued:
+            self.executor.submit(run.id)
 
     async def close(self) -> None:
         await self.executor.close()
+        if self.vault is not None:
+            await self.vault.close()
         if self.redis is not None:
             await self.redis.aclose()
         await self.database.dispose()
 
 
 def build_services(settings: Settings) -> AppServices:
-    database = Database(settings.platform.database_url)
-    redis = Redis.from_url(settings.platform.redis_url)
+    database = Database(
+        settings.platform.database_url,
+        password=settings.database_password(),
+    )
+    redis = Redis.from_url(
+        settings.platform.redis_url,
+        password=settings.redis_password(),
+    )
     sessions = RedisSessionStore(redis)
     identities = IdentityService(database.session_factory)
     conversations = ConversationService(database.session_factory, identities, settings.limits)
@@ -68,7 +96,11 @@ def build_services(settings: Settings) -> AppServices:
     control = RedisRunControl(redis)
     provider = OpenAICompatibleProvider(settings.model)
     oidc = OidcLoginService(settings.oidc, settings.platform, sessions, identities)
-    vault = MemoryCredentialVault()
+    vault: CredentialVault
+    if settings.credentials.backend == CredentialVaultBackend.HASHICORP_VAULT:
+        vault = HashicorpVaultCredentialVault(settings.credentials)
+    else:
+        vault = MemoryCredentialVault()
     mcp_registry = McpServerRegistry(database.session_factory, identities)
     connections = ConnectionService(
         database.session_factory,
@@ -85,10 +117,28 @@ def build_services(settings: Settings) -> AppServices:
         ttl_seconds=settings.mcp_gateway.catalog_ttl_seconds,
         vault=vault,
     )
-    gateway = McpGateway(catalog, audit=_tool_audit_writer(database.session_factory))
+    gateway = McpGateway(
+        catalog,
+        rate_limiter=RedisSlidingWindowRateLimiter(redis),
+        circuit_breaker=RedisCircuitBreaker(redis),
+        audit=_tool_audit_writer(database.session_factory),
+    )
     permission_system = PermissionSystemService(
         gateway,
         expected_tools=settings.permission_system.expected_tools,
+    )
+    quota = (
+        RedisRunQuota(
+            redis,
+            settings.governance.quota,
+            settings.limits,
+            lease_seconds=(
+                int(settings.limits.max_run_seconds + settings.governance.shutdown_grace_seconds)
+                + 60
+            ),
+        )
+        if settings.governance.enabled and settings.governance.quota.enabled
+        else None
     )
     executor = RunExecutor(
         conversations,
@@ -105,6 +155,8 @@ def build_services(settings: Settings) -> AppServices:
             else None
         ),
         personal_tools_only=settings.permission_system.enabled,
+        quota=quota,
+        shutdown_grace_seconds=settings.governance.shutdown_grace_seconds,
     )
     return AppServices(
         database=database,
@@ -117,6 +169,7 @@ def build_services(settings: Settings) -> AppServices:
         control=control,
         executor=executor,
         provider=provider,
+        quota=quota,
         vault=vault,
         mcp_registry=mcp_registry,
         connections=connections,

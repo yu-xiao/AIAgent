@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -14,8 +15,20 @@ from sqlalchemy.ext.asyncio import (
 
 
 class Database:
-    def __init__(self, url: str, *, echo: bool = False) -> None:
-        self.engine: AsyncEngine = create_async_engine(url, echo=echo, pool_pre_ping=True)
+    def __init__(
+        self,
+        url: str,
+        *,
+        echo: bool = False,
+        password: str | None = None,
+    ) -> None:
+        connect_args: dict[str, Any] = {"password": password} if password else {}
+        self.engine: AsyncEngine = create_async_engine(
+            url,
+            echo=echo,
+            pool_pre_ping=True,
+            connect_args=connect_args,
+        )
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,

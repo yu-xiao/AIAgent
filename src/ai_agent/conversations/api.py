@@ -19,7 +19,7 @@ from ai_agent.identity.dependencies import (
     OrganizationId,
     require_csrf,
 )
-from ai_agent.persistence.models import Conversation, Message, Run
+from ai_agent.persistence.models import Conversation, Message, Run, RunStatus
 
 router = APIRouter(prefix="/api/v1")
 _EVENT_ID = re.compile(r"^[0-9]+-[0-9]+$")
@@ -177,6 +177,17 @@ async def create_message_run(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent Runs are disabled by the global switch.",
         )
+    services = request.app.state.services
+    if services.quota is not None and not await services.quota.runs_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent Runs are disabled by the operational switch.",
+        )
+    if not services.executor.accepting:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent Runs are draining for service shutdown.",
+        )
     if idempotency_key is not None and not 1 <= len(idempotency_key) <= 200:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -188,21 +199,49 @@ async def create_message_run(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Message content must not be blank.",
         )
-    run, created = await request.app.state.services.conversations.create_run(
-        identity.session.user_id,
-        organization_id,
-        conversation_id,
-        content,
-        idempotency_key,
-        request.state.trace_id,
-    )
+    quota_lease = None
+    if services.quota is not None:
+        quota_lease = await services.quota.acquire(
+            organization_id,
+            identity.session.user_id,
+            str(request.state.trace_id),
+        )
+    try:
+        run, created = await services.conversations.create_run(
+            identity.session.user_id,
+            organization_id,
+            conversation_id,
+            content,
+            idempotency_key,
+            request.state.trace_id,
+        )
+    except Exception:
+        if services.quota is not None and quota_lease is not None:
+            await services.quota.rollback(quota_lease)
+        raise
     if created:
-        await request.app.state.services.events.publish(
+        await services.events.publish(
             run.id,
             "run.queued",
             {"trace_id": str(run.trace_id)},
         )
-        request.app.state.services.executor.submit(run.id)
+        try:
+            services.executor.submit(run.id, quota_lease)
+        except RuntimeError as exc:
+            if services.quota is not None and quota_lease is not None:
+                await services.quota.rollback(quota_lease)
+            await services.conversations.finish_run_with_error(
+                run.id,
+                RunStatus.FAILED,
+                "service_draining",
+                "Run was rejected because the service is draining.",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Agent Runs are draining for service shutdown.",
+            ) from exc
+    elif services.quota is not None and quota_lease is not None:
+        await services.quota.rollback(quota_lease)
     return _run_view(run)
 
 

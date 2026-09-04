@@ -9,9 +9,12 @@ import sys
 from collections.abc import Sequence
 
 import uvicorn
+from redis.asyncio import Redis
 
 from ai_agent.config import Settings
 from ai_agent.errors import AiAgentError, ConfigurationError
+from ai_agent.governance.quota import RedisRunQuota
+from ai_agent.governance.retention import AuditRetentionService
 from ai_agent.mcp.auth import (
     AccessTokenProvider,
     ClientCredentialsTokenProvider,
@@ -19,6 +22,9 @@ from ai_agent.mcp.auth import (
 )
 from ai_agent.mcp.client import McpProbeClient
 from ai_agent.oauth.client import DiscoveryClient
+from ai_agent.observability.logging import configure_logging
+from ai_agent.persistence import Database
+from ai_agent.persistence.models import AuditLog
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,12 +55,23 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Run the P0 FastAPI service")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+
+    prune = subparsers.add_parser("prune-audit", help="Apply configured audit retention")
+    prune.add_argument(
+        "--execute",
+        action="store_true",
+        help="Delete matching records; omission performs a dry run",
+    )
+
+    runs = subparsers.add_parser("runs", help="Operate the distributed Run switch")
+    runs.add_argument("action", choices=("enable", "disable", "status"))
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = Settings()
+    configure_logging(settings.log_level)
     try:
         if args.command == "check-config":
             settings.validate_runtime(
@@ -82,10 +99,83 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log_level=settings.log_level.lower(),
             )
             return 0
+        if args.command == "prune-audit":
+            return asyncio.run(_prune_audit(settings, execute=args.execute))
+        if args.command == "runs":
+            return asyncio.run(_operate_runs(settings, args.action))
     except (AiAgentError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 2
+
+
+async def _prune_audit(settings: Settings, *, execute: bool) -> int:
+    settings.validate_runtime()
+    if not settings.platform.enabled:
+        raise ConfigurationError("Audit retention requires the platform to be enabled.")
+    database = Database(
+        settings.platform.database_url,
+        password=settings.database_password(),
+    )
+    try:
+        result = await AuditRetentionService(database.session_factory).prune(
+            settings.governance.audit_retention_days,
+            execute=execute,
+        )
+        _print_json(
+            {
+                "status": "executed" if execute else "dry_run",
+                "cutoff": result.cutoff.isoformat(),
+                "matched": result.matched,
+            }
+        )
+    finally:
+        await database.dispose()
+    return 0
+
+
+async def _operate_runs(settings: Settings, action: str) -> int:
+    settings.validate_runtime()
+    if not settings.platform.enabled or not settings.governance.quota.enabled:
+        raise ConfigurationError("Distributed Run control requires platform quotas to be enabled.")
+    redis = Redis.from_url(settings.platform.redis_url, password=settings.redis_password())
+    quota = RedisRunQuota(
+        redis,
+        settings.governance.quota,
+        settings.limits,
+        lease_seconds=int(settings.limits.max_run_seconds) + 60,
+    )
+    database = Database(
+        settings.platform.database_url,
+        password=settings.database_password(),
+    )
+    try:
+        if action == "disable":
+            await quota.disable_runs()
+            await _write_control_audit(database, "governance.runs_disabled")
+        elif action == "enable":
+            await quota.enable_runs()
+            await _write_control_audit(database, "governance.runs_enabled")
+        _print_json({"runs_enabled": await quota.runs_enabled()})
+    finally:
+        await redis.aclose()
+        await database.dispose()
+    return 0
+
+
+async def _write_control_audit(database: Database, action: str) -> None:
+    async with database.session_factory() as session, session.begin():
+        session.add(
+            AuditLog(
+                organization_id=None,
+                actor_user_id=None,
+                action=action,
+                resource_type="platform",
+                resource_id=None,
+                trace_id=None,
+                details={"source": "operator_cli"},
+            )
+        )
 
 
 async def _probe_oidc(settings: Settings) -> int:

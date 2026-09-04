@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
@@ -23,6 +24,11 @@ class TokenEndpointAuthMethod(StrEnum):
     CLIENT_SECRET_POST = "client_secret_post"
 
 
+class CredentialVaultBackend(StrEnum):
+    MEMORY = "memory"
+    HASHICORP_VAULT = "hashicorp_vault"
+
+
 class OidcSettings(BaseModel):
     enabled: bool = False
     issuer: str = "http://localhost:8081/realms/ai-agent"
@@ -37,7 +43,9 @@ class OidcSettings(BaseModel):
 class PlatformSettings(BaseModel):
     enabled: bool = False
     database_url: str = "postgresql+asyncpg://ai_agent@localhost:5432/ai_agent"
+    database_password_file: str = ""
     redis_url: str = "redis://localhost:6379/0"
+    redis_password_file: str = ""
     runs_enabled: bool = True
     session_ttl_seconds: int = Field(default=28_800, ge=300, le=604_800)
     oauth_transaction_ttl_seconds: int = Field(default=600, ge=60, le=1_800)
@@ -53,6 +61,7 @@ class ModelSettings(BaseModel):
     base_url: str = ""
     model: str = ""
     api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    api_key_file: str = ""
     request_timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
     input_price_per_million_tokens: float = Field(default=0.0, ge=0.0)
     output_price_per_million_tokens: float = Field(default=0.0, ge=0.0)
@@ -121,6 +130,43 @@ class McpGatewaySettings(BaseModel):
     circuit_breaker_recovery_seconds: float = Field(default=30.0, ge=1.0, le=3_600.0)
 
 
+class CredentialSettings(BaseModel):
+    backend: CredentialVaultBackend = CredentialVaultBackend.MEMORY
+    address: str = ""
+    mount_path: str = "secret"
+    path_prefix: str = "ai-agent/credentials"
+    token_file: str = ""
+    namespace: str = ""
+    request_timeout_seconds: float = Field(default=5.0, ge=0.5, le=60.0)
+
+
+class QuotaSettings(BaseModel):
+    enabled: bool = False
+    max_concurrent_runs_per_user: int = Field(default=2, ge=1, le=100)
+    max_concurrent_runs_per_organization: int = Field(default=20, ge=1, le=10_000)
+    max_runs_per_user_per_minute: int = Field(default=10, ge=1, le=10_000)
+    max_daily_tokens_per_user: int = Field(default=1_000_000, ge=1, le=2_000_000_000)
+    max_daily_tokens_per_organization: int = Field(default=20_000_000, ge=1, le=2_000_000_000)
+    max_daily_cost_usd_per_user: float = Field(default=10.0, gt=0.0, le=1_000_000.0)
+    max_daily_cost_usd_per_organization: float = Field(default=100.0, gt=0.0, le=10_000_000.0)
+
+
+class GovernanceSettings(BaseModel):
+    enabled: bool = False
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1_024, le=50_000_000)
+    shutdown_grace_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
+    stale_run_after_seconds: int = Field(default=300, ge=90, le=86_400)
+    audit_retention_days: int = Field(default=365, ge=30, le=3_650)
+    quota: QuotaSettings = Field(default_factory=QuotaSettings)
+
+
+class ObservabilitySettings(BaseModel):
+    tracing_enabled: bool = False
+    service_name: str = "enterprise-ai-agent"
+    otlp_endpoint: str = ""
+    trace_sample_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -141,6 +187,9 @@ class Settings(BaseSettings):
     oidc: OidcSettings = Field(default_factory=OidcSettings)
     permission_system: PermissionSystemSettings = Field(default_factory=PermissionSystemSettings)
     mcp_gateway: McpGatewaySettings = Field(default_factory=McpGatewaySettings)
+    credentials: CredentialSettings = Field(default_factory=CredentialSettings)
+    governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     def validate_runtime(
         self,
@@ -166,6 +215,12 @@ class Settings(BaseSettings):
             self._validate_mcp_gateway()
         if self.platform.enabled:
             self._validate_platform()
+        if self.credentials.backend == CredentialVaultBackend.HASHICORP_VAULT:
+            self._validate_vault()
+        if self.observability.tracing_enabled:
+            self._validate_observability()
+        if self.environment == Environment.PRODUCTION and self.platform.enabled:
+            self._validate_production_governance()
 
     def _validate_oidc(self) -> None:
         if not self.oidc.client_id.strip():
@@ -224,6 +279,7 @@ class Settings(BaseSettings):
             )
 
     def _validate_platform(self) -> None:
+        self._load_secret_files()
         if not self.oidc.enabled:
             raise ConfigurationError("OIDC must be enabled when the P1 platform is enabled.")
         if not self.model.enabled:
@@ -270,6 +326,63 @@ class Settings(BaseSettings):
         if not self.platform.enabled:
             raise ConfigurationError("P2 MCP Gateway requires the platform to be enabled.")
 
+    def _validate_vault(self) -> None:
+        credentials = self.credentials
+        _validate_http_url(
+            credentials.address,
+            "HashiCorp Vault address",
+            require_https=self.environment == Environment.PRODUCTION,
+        )
+        if not credentials.mount_path.strip("/") or not credentials.path_prefix.strip("/"):
+            raise ConfigurationError("HashiCorp Vault mount path and path prefix are required.")
+        _read_secret_file(credentials.token_file, "HashiCorp Vault token")
+
+    def _validate_observability(self) -> None:
+        if not self.observability.otlp_endpoint:
+            raise ConfigurationError("OTLP endpoint is required when tracing is enabled.")
+        _validate_http_url(
+            self.observability.otlp_endpoint,
+            "OTLP endpoint",
+            require_https=False,
+        )
+
+    def _validate_production_governance(self) -> None:
+        if not self.governance.enabled:
+            raise ConfigurationError("Production platform requires governance to be enabled.")
+        if not self.governance.quota.enabled:
+            raise ConfigurationError(
+                "Production platform requires distributed quotas to be enabled."
+            )
+        if self.credentials.backend != CredentialVaultBackend.HASHICORP_VAULT:
+            raise ConfigurationError("Production platform requires the HashiCorp Vault backend.")
+        if not self.platform.database_password_file:
+            raise ConfigurationError("Production database password must be loaded from a file.")
+        if not self.platform.redis_password_file:
+            raise ConfigurationError("Production Redis password must be loaded from a file.")
+        if not self.model.api_key_file:
+            raise ConfigurationError("Production model API key must be loaded from a file.")
+        database = urlsplit(self.platform.database_url)
+        if database.password:
+            raise ConfigurationError("Production database URL must not contain a password.")
+        _read_secret_file(self.platform.database_password_file, "database password")
+        _read_secret_file(self.platform.redis_password_file, "Redis password")
+
+    def _load_secret_files(self) -> None:
+        if self.model.api_key_file:
+            self.model.api_key = SecretStr(
+                _read_secret_file(self.model.api_key_file, "model API key")
+            )
+
+    def database_password(self) -> str | None:
+        if not self.platform.database_password_file:
+            return None
+        return _read_secret_file(self.platform.database_password_file, "database password")
+
+    def redis_password(self) -> str | None:
+        if not self.platform.redis_password_file:
+            return None
+        return _read_secret_file(self.platform.redis_password_file, "Redis password")
+
 
 def _validate_client_auth(
     method: TokenEndpointAuthMethod,
@@ -302,3 +415,16 @@ def _validate_redis_url(value: str) -> None:
         raise ConfigurationError("Redis URL must not include embedded credentials.")
     if parsed.fragment:
         raise ConfigurationError("Redis URL must not include a fragment.")
+
+
+def _read_secret_file(value: str, label: str) -> str:
+    if not value:
+        raise ConfigurationError(f"{label} file is required.")
+    path = Path(value)
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ConfigurationError(f"{label} file cannot be read.") from exc
+    if not secret:
+        raise ConfigurationError(f"{label} file must not be empty.")
+    return secret

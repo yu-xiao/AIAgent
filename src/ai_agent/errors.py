@@ -49,5 +49,9 @@ class RunLimitError(AiAgentError):
     """Raised when an Agent run would exceed a deterministic hard limit."""
 
 
+class QuotaExceededError(AiAgentError):
+    """Raised when a distributed user or organization quota denies a Run."""
+
+
 class ModelProviderError(AiAgentError):
     """Raised when the configured model provider fails with a safe public message."""
