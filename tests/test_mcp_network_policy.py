@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import httpx2
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from ai_agent.config import McpGatewaySettings
 from ai_agent.errors import McpConnectionError
 from ai_agent.mcp.auth import StaticAccessTokenProvider
-from ai_agent.mcp.client import McpProbeClient
+from ai_agent.mcp.client import McpHttpClient, McpProbeClient
 from ai_agent.mcp.network_policy import McpNetworkPolicy, McpNetworkPolicyError
 
 
@@ -106,3 +107,28 @@ async def test_probe_converts_network_policy_failure_without_leaking_token() -> 
 
     assert str(raised.value) == "MCP endpoint is not allowed by the outbound network policy."
     assert token not in str(raised.value)
+
+
+@pytest.mark.parametrize("status_code", [300, 301, 302, 303, 307, 308])
+async def test_mcp_http_client_rejects_redirect_responses(status_code: int) -> None:
+    requested_urls: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requested_urls.append(str(request.url))
+        return httpx2.Response(
+            status_code,
+            headers={"Location": "http://169.254.169.254/latest/meta-data"},
+        )
+
+    async with McpHttpClient(
+        transport=httpx2.MockTransport(handler),
+        follow_redirects=True,
+        trust_env=False,
+    ) as client:
+        with pytest.raises(
+            McpNetworkPolicyError,
+            match=r"MCP endpoint returned an HTTP redirect, which is not allowed\.",
+        ):
+            await client.get("http://mcp.example.test/mcp")
+
+    assert requested_urls == ["http://mcp.example.test/mcp"]

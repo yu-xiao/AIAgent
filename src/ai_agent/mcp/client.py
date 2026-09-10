@@ -7,6 +7,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 import httpx2
+from httpx2._client import UseClientDefault
+from httpx2._types import AuthTypes
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult
@@ -15,6 +17,32 @@ from ai_agent.errors import McpConnectionError, ProtocolValidationError
 from ai_agent.mcp.auth import AccessTokenProvider
 from ai_agent.mcp.models import McpProbeResult, ToolCallSummary, ToolDescriptor
 from ai_agent.mcp.network_policy import McpNetworkPolicy, McpNetworkPolicyError
+
+
+class McpHttpClient(httpx2.AsyncClient):
+    """HTTP client that refuses redirects for authenticated MCP traffic."""
+
+    async def send(
+        self,
+        request: httpx2.Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = httpx2.USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = httpx2.USE_CLIENT_DEFAULT,
+    ) -> httpx2.Response:
+        del follow_redirects
+        response = await super().send(
+            request,
+            stream=stream,
+            auth=auth,
+            follow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            await response.aclose()
+            raise McpNetworkPolicyError(
+                "MCP endpoint returned an HTTP redirect, which is not allowed."
+            )
+        return response
 
 
 class McpProbeClient:
@@ -49,7 +77,7 @@ class McpProbeClient:
 
         try:
             await self._network_policy.validate_url_resolution(self._mcp_url)
-            async with httpx2.AsyncClient(
+            async with McpHttpClient(
                 headers=headers,
                 timeout=self._timeout_seconds,
                 follow_redirects=False,
@@ -197,7 +225,7 @@ class McpToolClient:
         }
         try:
             await self._network_policy.validate_url_resolution(self._mcp_url)
-            async with httpx2.AsyncClient(
+            async with McpHttpClient(
                 headers=headers,
                 timeout=self._timeout_seconds,
                 follow_redirects=False,
