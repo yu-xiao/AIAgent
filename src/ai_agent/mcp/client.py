@@ -14,6 +14,7 @@ from mcp.types import CallToolResult
 from ai_agent.errors import McpConnectionError, ProtocolValidationError
 from ai_agent.mcp.auth import AccessTokenProvider
 from ai_agent.mcp.models import McpProbeResult, ToolCallSummary, ToolDescriptor
+from ai_agent.mcp.network_policy import McpNetworkPolicy, McpNetworkPolicyError
 
 
 class McpProbeClient:
@@ -24,11 +25,13 @@ class McpProbeClient:
         token_provider: AccessTokenProvider,
         expected_tools: tuple[str, ...] = (),
         timeout_seconds: float = 10.0,
+        network_policy: McpNetworkPolicy | None = None,
     ) -> None:
         self._mcp_url = mcp_url
         self._token_provider = token_provider
         self._expected_tools = expected_tools
         self._timeout_seconds = timeout_seconds
+        self._network_policy = network_policy or McpNetworkPolicy()
 
     async def probe(
         self,
@@ -45,6 +48,7 @@ class McpProbeClient:
         }
 
         try:
+            await self._network_policy.validate_url_resolution(self._mcp_url)
             async with httpx2.AsyncClient(
                 headers=headers,
                 timeout=self._timeout_seconds,
@@ -114,6 +118,10 @@ class McpProbeClient:
                 missing_expected_tools=missing,
                 sample_call=sample_call,
             )
+        except McpNetworkPolicyError as exc:
+            raise McpConnectionError(
+                "MCP endpoint is not allowed by the outbound network policy."
+            ) from exc
         except ProtocolValidationError:
             raise
         except Exception as exc:
@@ -137,12 +145,14 @@ class McpToolClient:
         timeout_seconds: float = 10.0,
         extra_headers: dict[str, str] | None = None,
         credential_header: str = "Authorization",
+        network_policy: McpNetworkPolicy | None = None,
     ) -> None:
         self._mcp_url = mcp_url
         self._token_provider = token_provider
         self._timeout_seconds = timeout_seconds
         self._extra_headers = extra_headers or {}
         self._credential_header = credential_header
+        self._network_policy = network_policy or McpNetworkPolicy()
 
     async def list_tools(self) -> list[ToolDescriptor]:
         async def operation(session: ClientSession) -> list[ToolDescriptor]:
@@ -186,6 +196,7 @@ class McpToolClient:
             **self._extra_headers,
         }
         try:
+            await self._network_policy.validate_url_resolution(self._mcp_url)
             async with httpx2.AsyncClient(
                 headers=headers,
                 timeout=self._timeout_seconds,
@@ -204,6 +215,10 @@ class McpToolClient:
                         read_timeout_seconds=self._timeout_seconds,
                     ) as session:
                         return await operation(session)
+        except McpNetworkPolicyError as exc:
+            raise McpConnectionError(
+                "MCP endpoint is not allowed by the outbound network policy."
+            ) from exc
         except (ProtocolValidationError, McpConnectionError):
             raise
         except Exception as exc:

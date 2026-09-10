@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -128,6 +129,40 @@ class McpGatewaySettings(BaseModel):
     max_concurrency: int = Field(default=20, ge=1, le=1_000)
     circuit_breaker_threshold: int = Field(default=3, ge=1, le=100)
     circuit_breaker_recovery_seconds: float = Field(default=30.0, ge=1.0, le=3_600.0)
+    allow_local_addresses: bool = True
+    allow_private_addresses: bool = False
+    allowed_hosts: tuple[str, ...] = ()
+    allowed_ips: tuple[str, ...] = ()
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def normalize_allowed_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for item in value:
+            host = item.strip().lower().rstrip(".")
+            if not host or any(character.isspace() for character in host):
+                raise ValueError(
+                    "MCP allowed hosts must be non-empty host names without whitespace."
+                )
+            if host not in normalized:
+                normalized.append(host)
+        return tuple(normalized)
+
+    @field_validator("allowed_ips")
+    @classmethod
+    def normalize_allowed_ips(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for item in value:
+            try:
+                network = ipaddress.ip_network(item.strip(), strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    "MCP allowed IPs must be valid IP addresses or CIDR networks."
+                ) from exc
+            canonical = str(network)
+            if canonical not in normalized:
+                normalized.append(canonical)
+        return tuple(normalized)
 
 
 class CredentialSettings(BaseModel):

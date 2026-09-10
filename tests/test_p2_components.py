@@ -303,15 +303,16 @@ async def test_personal_oauth_connection_uses_one_time_state_and_vault(p2_runtim
         )
 
 
-def test_mcp_server_rejects_private_target() -> None:
-    with pytest.raises(ProtocolValidationError):
-        McpServerSpec(
-            code="private",
-            display_name="Private",
-            system_code="internal",
-            mcp_url="http://127.0.0.1:8000/mcp",
-            auth_mode=McpAuthMode.API_KEY,
-        )
+def test_mcp_server_spec_allows_local_target_for_runtime_policy() -> None:
+    spec = McpServerSpec(
+        code="local",
+        display_name="Local",
+        system_code="internal",
+        mcp_url="http://127.0.0.1:8000/mcp",
+        auth_mode=McpAuthMode.API_KEY,
+    )
+
+    assert spec.mcp_url == "http://127.0.0.1:8000/mcp"
 
 
 async def test_connection_center_api_hides_secret_and_requires_csrf(platform_runtime) -> None:

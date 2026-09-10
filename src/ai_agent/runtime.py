@@ -27,6 +27,7 @@ from ai_agent.mcp.gateway import (
     RedisCircuitBreaker,
     RedisSlidingWindowRateLimiter,
 )
+from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.mcp.registry import McpServerRegistry
 from ai_agent.mcp.tool_catalog import RedisCatalogCache, ToolCatalogService
 from ai_agent.models import ModelProvider
@@ -101,7 +102,17 @@ def build_services(settings: Settings) -> AppServices:
         vault = HashicorpVaultCredentialVault(settings.credentials)
     else:
         vault = MemoryCredentialVault()
-    mcp_registry = McpServerRegistry(database.session_factory, identities)
+    network_policy = McpNetworkPolicy.from_values(
+        allow_local_addresses=settings.mcp_gateway.allow_local_addresses,
+        allow_private_addresses=settings.mcp_gateway.allow_private_addresses,
+        allowed_hosts=settings.mcp_gateway.allowed_hosts,
+        allowed_ips=settings.mcp_gateway.allowed_ips,
+    )
+    mcp_registry = McpServerRegistry(
+        database.session_factory,
+        identities,
+        network_policy=network_policy,
+    )
     connections = ConnectionService(
         database.session_factory,
         identities,
@@ -117,6 +128,7 @@ def build_services(settings: Settings) -> AppServices:
         RedisCatalogCache(redis),
         ttl_seconds=settings.mcp_gateway.catalog_ttl_seconds,
         vault=vault,
+        network_policy=network_policy,
     )
     gateway = McpGateway(
         catalog,

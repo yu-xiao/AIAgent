@@ -16,6 +16,7 @@ from ai_agent.credentials.vault import CredentialVault
 from ai_agent.errors import AuthorizationError, McpConnectionError, ResourceNotFoundError
 from ai_agent.mcp.client import McpToolClient
 from ai_agent.mcp.models import RunContext, ToolDefinition, ToolDescriptor
+from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.mcp.registry import McpServerRegistry
 from ai_agent.persistence.models import ExternalConnection, McpServerDefinition
 
@@ -112,12 +113,14 @@ class ToolCatalogService:
         ]
         | None = None,
         vault: CredentialVault | None = None,
+        network_policy: McpNetworkPolicy | None = None,
     ) -> None:
         self._registry = registry
         self._connections = connections
         self._cache = cache or MemoryCatalogCache()
         self._ttl_seconds = ttl_seconds
         self._vault = vault
+        self._network_policy = network_policy or McpNetworkPolicy()
         self._client_factory = client_factory or self._default_client
 
     async def list_tools(
@@ -294,6 +297,7 @@ class ToolCatalogService:
             token_provider=VaultAccessTokenProvider(self._vault, connection.credential_reference),
             timeout_seconds=server.timeout_seconds,
             credential_header=server.credential_header,
+            network_policy=self._network_policy,
             extra_headers={
                 "X-Trace-Id": context.trace_id,
                 "X-Agent-User-Id": str(context.user_id),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -17,6 +16,7 @@ from ai_agent.errors import (
     ResourceNotFoundError,
 )
 from ai_agent.identity.service import MCP_SERVER_MANAGE, MCP_SERVER_VIEW, IdentityService
+from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.persistence.models import AuditLog, McpAuthMode, McpServerDefinition, McpTransport
 
 
@@ -127,9 +127,11 @@ class McpServerRegistry:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         identities: IdentityService,
+        network_policy: McpNetworkPolicy | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
+        self._network_policy = network_policy or McpNetworkPolicy()
 
     async def create(
         self,
@@ -139,6 +141,7 @@ class McpServerRegistry:
         *,
         trace_id: UUID | None = None,
     ) -> McpServerDefinition:
+        self._network_policy.validate_url(spec.mcp_url)
         await self._identities.access(actor_id, organization_id, MCP_SERVER_MANAGE)
         async with self._session_factory() as session, session.begin():
             existing = await session.scalar(
@@ -224,7 +227,7 @@ class McpServerRegistry:
                 raise ResourceNotFoundError("MCP Server not found.")
             values = changes.model_dump(exclude_unset=True)
             if "mcp_url" in values:
-                _validate_mcp_url(values["mcp_url"])
+                self._network_policy.validate_url(values["mcp_url"])
             for name, value in values.items():
                 setattr(server, name, value)
             server.config_version += 1
@@ -249,23 +252,6 @@ def _validate_mcp_url(value: str) -> None:
         raise ProtocolValidationError("MCP Server URL must be an absolute HTTP or HTTPS URL.")
     if parsed.username or parsed.password or parsed.fragment:
         raise ProtocolValidationError("MCP Server URL must not contain credentials or fragments.")
-    host = parsed.hostname.lower()
-    if host in {"localhost", "localhost.localdomain"}:
-        raise ProtocolValidationError("MCP Server URL must not target localhost.")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if address is not None and (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-    ):
-        raise ProtocolValidationError(
-            "MCP Server URL must not target a private or reserved address."
-        )
 
 
 def _validate_http_url(value: str) -> None:

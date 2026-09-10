@@ -21,6 +21,7 @@ from ai_agent.mcp.auth import (
     StaticAccessTokenProvider,
 )
 from ai_agent.mcp.client import McpProbeClient
+from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.oauth.client import DiscoveryClient
 from ai_agent.observability.logging import configure_logging
 from ai_agent.persistence import Database
@@ -226,6 +227,7 @@ async def _probe_permission(
         token_provider=_build_permission_token_provider(settings),
         expected_tools=permission.expected_tools,
         timeout_seconds=permission.request_timeout_seconds,
+        network_policy=_mcp_network_policy(settings),
     )
     result = await probe.probe(
         call_tool_name="list_datasets" if call_list_datasets else None,
@@ -238,6 +240,15 @@ async def _probe_permission(
         }
     )
     return 0
+
+
+def _mcp_network_policy(settings: Settings) -> McpNetworkPolicy:
+    return McpNetworkPolicy.from_values(
+        allow_local_addresses=settings.mcp_gateway.allow_local_addresses,
+        allow_private_addresses=settings.mcp_gateway.allow_private_addresses,
+        allowed_hosts=settings.mcp_gateway.allowed_hosts,
+        allowed_ips=settings.mcp_gateway.allowed_ips,
+    )
 
 
 def _build_permission_token_provider(settings: Settings) -> AccessTokenProvider:
