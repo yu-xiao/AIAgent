@@ -59,6 +59,7 @@ class DiscoveryClient:
                 _require_absolute_urls(
                     metadata.authorization_endpoint,
                     metadata.token_endpoint,
+                    *([metadata.jwks_uri] if metadata.jwks_uri else []),
                 )
                 return metadata
             except (httpx.HTTPError, ValidationError, ProtocolValidationError) as exc:

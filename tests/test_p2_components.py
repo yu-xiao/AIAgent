@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 import jwt
 import pytest
 import respx
+from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import Response
 from mcp.types import CallToolResult, TextContent
 from pydantic import SecretStr
@@ -226,11 +229,30 @@ async def test_personal_oauth_connection_uses_one_time_state_and_vault(p2_runtim
             mcp_url="https://mcp.example.test/mcp",
             auth_mode=McpAuthMode.OAUTH_AUTHORIZATION_CODE,
             authorization_server="https://id.example.test",
-            authorization_endpoint="https://id.example.test/authorize",
-            token_endpoint="https://id.example.test/token",
             oauth_client_id="agent-client",
             required_scope="business.read",
         ),
+    )
+    issuer = "https://id.example.test"
+    authorization_endpoint = f"{issuer}/authorize"
+    token_endpoint = f"{issuer}/token"
+    jwks_uri = f"{issuer}/jwks"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_jwk = jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key())
+    respx.get(f"{issuer}/.well-known/openid-configuration").mock(
+        return_value=Response(
+            200,
+            json={
+                "issuer": issuer,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": token_endpoint,
+                "jwks_uri": jwks_uri,
+                "code_challenge_methods_supported": ["S256"],
+            },
+        )
+    )
+    respx.get(jwks_uri).mock(
+        return_value=Response(200, json={"keys": [{**json.loads(public_jwk), "kid": "key-1"}]})
     )
     url = await connections.begin_personal_authorization(user.id, organization.id, "oauth")
     from urllib.parse import parse_qs, urlsplit
@@ -249,13 +271,16 @@ async def test_personal_oauth_connection_uses_one_time_state_and_vault(p2_runtim
                 "scope": "business.read",
                 "id_token": jwt.encode(
                     {
-                        "iss": "https://id.example.test",
+                        "iss": issuer,
                         "aud": "agent-client",
                         "sub": "business-user-1",
                         "nonce": nonce,
+                        "iat": datetime.now(UTC),
+                        "exp": datetime.now(UTC) + timedelta(minutes=5),
                     },
-                    key="test-signing-key-for-p2-tests-0123456789",
-                    algorithm="HS256",
+                    key=private_key,
+                    algorithm="RS256",
+                    headers={"kid": "key-1"},
                 ),
             },
         )

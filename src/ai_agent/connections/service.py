@@ -7,7 +7,6 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-import jwt
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -30,6 +29,7 @@ from ai_agent.identity.service import (
 from ai_agent.identity.sessions import SessionStore, StoredOAuthTransaction
 from ai_agent.oauth.client import AuthorizationCodeClient, AuthorizationTransaction, DiscoveryClient
 from ai_agent.oauth.models import OAuthToken, OidcProviderMetadata
+from ai_agent.oauth.validator import OidcIdTokenValidator
 from ai_agent.persistence.models import (
     AuditLog,
     ConnectionOwnership,
@@ -55,6 +55,7 @@ class ConnectionService:
         *,
         default_client_id: str = "ai-agent-web",
         default_timeout_seconds: float = 10.0,
+        signing_algorithms: tuple[str, ...] = ("RS256",),
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
@@ -64,6 +65,10 @@ class ConnectionService:
         self._default_client_id = default_client_id
         self._default_timeout_seconds = default_timeout_seconds
         self._discovery = DiscoveryClient(timeout_seconds=default_timeout_seconds)
+        self._id_token_validator = OidcIdTokenValidator(
+            signing_algorithms=signing_algorithms,
+            timeout_seconds=default_timeout_seconds,
+        )
 
     async def begin_personal_authorization(
         self,
@@ -172,8 +177,12 @@ class ConnectionService:
                 transaction=transaction,
                 returned_state=state,
             )
-            subject = _subject_from_token(
-                token, metadata, stored.nonce, self._oauth_client_id(server)
+            subject = await _subject_from_token(
+                token,
+                metadata,
+                stored.nonce,
+                self._oauth_client_id(server),
+                validator=self._id_token_validator,
             )
             credential = _credential_from_token(token)
             access_reference = await self._vault.put(credential)
@@ -675,32 +684,27 @@ def _scopes(token: OAuthToken, server: McpServerDefinition) -> list[str]:
     return scopes or ([server.required_scope] if server.required_scope else [])
 
 
-def _subject_from_token(
+async def _subject_from_token(
     token: OAuthToken,
     metadata: OidcProviderMetadata,
     expected_nonce: str,
     client_id: str,
+    *,
+    validator: OidcIdTokenValidator,
 ) -> str:
     if token.id_token is None:
         if token.subject:
             return token.subject
         raise AuthenticationError("OAuth response has no stable external subject.")
-    try:
-        claims = jwt.decode(token.id_token.get_secret_value(), options={"verify_signature": False})
-    except jwt.PyJWTError as exc:
-        raise AuthenticationError("OAuth ID token is invalid.") from exc
+    claims = await validator.validate(
+        token.id_token.get_secret_value(),
+        metadata,
+        client_id=client_id,
+        expected_nonce=expected_nonce,
+    )
     subject = claims.get("sub")
     if not isinstance(subject, str) or not subject.strip():
         raise AuthenticationError("OAuth ID token has no stable subject.")
     if token.subject and token.subject != subject:
         raise AuthenticationError("OAuth subject does not match the ID token.")
-    if metadata.issuer and claims.get("iss") != metadata.issuer:
-        raise AuthenticationError("OAuth ID token issuer validation failed.")
-    audience = claims.get("aud")
-    audiences = [audience] if isinstance(audience, str) else audience
-    if audience is not None and (not isinstance(audiences, list) or client_id not in audiences):
-        raise AuthenticationError("OAuth ID token audience validation failed.")
-    nonce = claims.get("nonce")
-    if not isinstance(nonce, str) or nonce != expected_nonce:
-        raise AuthenticationError("OAuth nonce validation failed.")
     return subject

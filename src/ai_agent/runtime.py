@@ -109,6 +109,7 @@ def build_services(settings: Settings) -> AppServices:
         vault,
         settings.platform,
         default_timeout_seconds=settings.mcp_gateway.default_timeout_seconds,
+        signing_algorithms=settings.oidc.signing_algorithms,
     )
     catalog = ToolCatalogService(
         mcp_registry,

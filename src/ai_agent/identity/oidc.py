@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import secrets
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
-import jwt
-from jwt import PyJWK
 from pydantic import SecretStr
 
 from ai_agent.config import OidcSettings, PlatformSettings
@@ -18,6 +14,7 @@ from ai_agent.identity.service import IdentityService
 from ai_agent.identity.sessions import SessionStore, StoredOAuthTransaction
 from ai_agent.oauth.client import AuthorizationCodeClient, AuthorizationTransaction, DiscoveryClient
 from ai_agent.oauth.models import OidcProviderMetadata
+from ai_agent.oauth.validator import OidcIdTokenValidator
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +36,9 @@ class OidcLoginService:
         self._sessions = sessions
         self._identities = identities
         self._discovery = DiscoveryClient()
+        self._id_token_validator = OidcIdTokenValidator(
+            signing_algorithms=oidc.signing_algorithms,
+        )
 
     async def begin(self) -> str:
         metadata = await self._discovery.discover_oidc(self._oidc.issuer)
@@ -79,7 +79,7 @@ class OidcLoginService:
         if token.id_token is None or metadata.jwks_uri is None:
             raise AuthenticationError("OIDC response is missing a verifiable ID token.")
         claims = await self._validate_id_token(
-            token.id_token.get_secret_value(), metadata.jwks_uri, stored.nonce
+            token.id_token.get_secret_value(), metadata, stored.nonce
         )
         user = await self._identities.upsert_oidc_user(
             issuer=self._oidc.issuer,
@@ -102,40 +102,14 @@ class OidcLoginService:
         )
 
     async def _validate_id_token(
-        self, encoded: str, jwks_uri: str, expected_nonce: str
+        self, encoded: str, metadata: OidcProviderMetadata, expected_nonce: str
     ) -> dict[str, Any]:
-        try:
-            header = jwt.get_unverified_header(encoded)
-            algorithm = header.get("alg")
-            key_id = header.get("kid")
-            if algorithm not in self._oidc.signing_algorithms or not isinstance(key_id, str):
-                raise AuthenticationError("OIDC ID token uses an untrusted signing key.")
-            async with httpx.AsyncClient(
-                timeout=10, follow_redirects=False, trust_env=False
-            ) as client:
-                response = await client.get(jwks_uri, headers={"Accept": "application/json"})
-                response.raise_for_status()
-                keys = response.json().get("keys", [])
-            key_data = next((item for item in keys if item.get("kid") == key_id), None)
-            if key_data is None:
-                raise AuthenticationError("OIDC signing key was not found.")
-            key = PyJWK.from_dict(key_data, algorithm=algorithm).key
-            claims = jwt.decode(
-                encoded,
-                key=key,
-                algorithms=list(self._oidc.signing_algorithms),
-                audience=self._oidc.client_id,
-                issuer=self._oidc.issuer,
-                options={"require": ["exp", "iat", "iss", "aud", "sub", "nonce"]},
-            )
-            nonce = _required_text(claims, "nonce")
-            if not secrets.compare_digest(nonce.encode(), expected_nonce.encode()):
-                raise AuthenticationError("OIDC nonce validation failed.")
-            return dict(claims)
-        except AuthenticationError:
-            raise
-        except (httpx.HTTPError, jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
-            raise AuthenticationError("OIDC ID token validation failed.") from exc
+        return await self._id_token_validator.validate(
+            encoded,
+            metadata,
+            client_id=self._oidc.client_id,
+            expected_nonce=expected_nonce,
+        )
 
 
 def _required_text(claims: dict[str, Any], name: str) -> str:
