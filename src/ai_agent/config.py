@@ -205,6 +205,45 @@ class ObservabilitySettings(BaseModel):
     trace_sample_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
 
 
+class SecuritySettings(BaseModel):
+    """HTTP boundary settings controlled by the deployment environment."""
+
+    allowed_hosts: tuple[str, ...] = ()
+    trusted_proxy_ips: tuple[str, ...] = ()
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def normalize_allowed_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for item in value:
+            host = item.strip().lower().rstrip(".")
+            if not host or any(character.isspace() for character in host):
+                raise ValueError("Security allowed hosts must be non-empty host patterns.")
+            if host != "*" and "*" in host and not host.startswith("*."):
+                raise ValueError("Security allowed host wildcards must use the *.example.com form.")
+            if host.count("*") > 1:
+                raise ValueError("Security allowed host patterns may contain at most one wildcard.")
+            if host not in normalized:
+                normalized.append(host)
+        return tuple(normalized)
+
+    @field_validator("trusted_proxy_ips")
+    @classmethod
+    def normalize_trusted_proxy_ips(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for item in value:
+            try:
+                network = ipaddress.ip_network(item.strip(), strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    "Trusted proxy IPs must be valid IP addresses or CIDR networks."
+                ) from exc
+            canonical = str(network)
+            if canonical not in normalized:
+                normalized.append(canonical)
+        return tuple(normalized)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -228,6 +267,7 @@ class Settings(BaseSettings):
     credentials: CredentialSettings = Field(default_factory=CredentialSettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
 
     def validate_runtime(
         self,
@@ -257,8 +297,22 @@ class Settings(BaseSettings):
             self._validate_vault()
         if self.observability.tracing_enabled:
             self._validate_observability()
-        if self.environment == Environment.PRODUCTION and self.platform.enabled:
-            self._validate_production_governance()
+        if self.environment == Environment.PRODUCTION:
+            self._validate_production_security()
+            if self.platform.enabled:
+                self._validate_production_governance()
+
+    def _validate_production_security(self) -> None:
+        if not self.security.allowed_hosts:
+            raise ConfigurationError(
+                "Production requires an explicit HTTP allowed host list."
+            )
+        if "*" in self.security.allowed_hosts:
+            raise ConfigurationError("Production HTTP allowed hosts must not contain '*'.")
+        if not self.security.trusted_proxy_ips:
+            raise ConfigurationError(
+                "Production requires an explicit trusted proxy IP or CIDR list."
+            )
 
     def _validate_oidc(self) -> None:
         if not self.oidc.client_id.strip():

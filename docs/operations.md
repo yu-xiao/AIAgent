@@ -10,7 +10,15 @@
 4. 确认网络只允许 API 访问已登记的 OIDC、模型、Vault、PostgreSQL、Redis 和
    PermissionSystem MCP 端点。SSRF 的最终边界必须包含出站防火墙或代理，不能只依赖
    URL 字符串校验。
-5. 执行 `ai-agent check-config` 和数据库备份，再运行 Alembic 迁移。
+5. 在 `.env.production` 中显式配置 `AI_AGENT_SECURITY__ALLOWED_HOSTS` 和
+   `AI_AGENT_SECURITY__TRUSTED_PROXY_IPS`。前者只填写用户访问的正式域名，后者只填写
+   Nginx/Ingress 到 API 的实际来源 IP 或 CIDR，禁止使用 `*` 或无边界的全网段。
+6. 执行 `ai-agent check-config` 和数据库备份，再运行 Alembic 迁移。
+
+生产镜像不会提供 `/docs`、`/redoc` 或 `/openapi.json`。`/metrics` 仅供 Compose 内部的
+Prometheus 访问，Nginx 对外拒绝该路径；不要将 API 的 8000 端口直接发布到公网。Uvicorn
+只在受信代理来源匹配 `TRUSTED_PROXY_IPS` 时处理 `X-Forwarded-For` 和
+`X-Forwarded-Proto`，其他来源的代理头会被忽略。
 
 Compose 通过以下宿主机环境变量读取密钥文件路径，不读取密钥值：
 

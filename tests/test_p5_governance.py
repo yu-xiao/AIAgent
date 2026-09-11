@@ -24,6 +24,7 @@ from ai_agent.config import (
     PlatformSettings,
     QuotaSettings,
     RunLimitSettings,
+    SecuritySettings,
     Settings,
 )
 from ai_agent.credentials.vault import Credential, HashicorpVaultCredentialVault
@@ -48,6 +49,10 @@ def test_production_configuration_requires_governance_and_vault(tmp_path) -> Non
     settings = Settings(
         _env_file=None,
         environment=Environment.PRODUCTION,
+        security=SecuritySettings(
+            allowed_hosts=("agent.example.test",),
+            trusted_proxy_ips=("172.20.0.0/16",),
+        ),
         platform=PlatformSettings(
             enabled=True,
             database_url="postgresql+asyncpg://ai_agent@postgres/ai_agent?ssl=require",

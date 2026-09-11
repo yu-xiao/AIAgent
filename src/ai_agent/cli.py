@@ -100,11 +100,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         if args.command == "serve":
+            settings.validate_runtime()
             uvicorn.run(
                 "ai_agent.main:app",
                 host=args.host or settings.host,
                 port=args.port or settings.port,
                 log_level=settings.log_level.lower(),
+                proxy_headers=bool(settings.security.trusted_proxy_ips),
+                forwarded_allow_ips=list(settings.security.trusted_proxy_ips),
             )
             return 0
         if args.command == "prune-audit":

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ai_agent.audit.api import router as audit_router
@@ -84,6 +85,8 @@ class RequestBodyLimitMiddleware:
 
 def create_app(settings: Settings | None = None, services: AppServices | None = None) -> FastAPI:
     runtime_settings = settings or Settings()
+    if runtime_settings.environment == Environment.PRODUCTION:
+        runtime_settings.validate_runtime()
     owns_services = services is None
     tracing = configure_tracing(runtime_settings.observability)
 
@@ -109,7 +112,18 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
             "PermissionSystem read-only business closure."
         ),
         lifespan=lifespan,
+        docs_url=None if runtime_settings.environment == Environment.PRODUCTION else "/docs",
+        redoc_url=None if runtime_settings.environment == Environment.PRODUCTION else "/redoc",
+        openapi_url=(
+            None if runtime_settings.environment == Environment.PRODUCTION else "/openapi.json"
+        ),
     )
+    if runtime_settings.security.allowed_hosts:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=list(runtime_settings.security.allowed_hosts),
+            www_redirect=False,
+        )
     tracing.instrument(app)
     app.add_middleware(
         RequestBodyLimitMiddleware,

@@ -9,6 +9,7 @@ from ai_agent.config import (
     OidcSettings,
     PermissionSystemSettings,
     PlatformSettings,
+    SecuritySettings,
     Settings,
 )
 from ai_agent.errors import ConfigurationError
@@ -64,3 +65,29 @@ def test_enabled_platform_requires_oidc_and_model_configuration() -> None:
     settings.oidc = OidcSettings(enabled=True)
     with pytest.raises(ConfigurationError, match="model provider must be enabled"):
         settings.validate_runtime()
+
+
+def test_production_requires_explicit_http_boundary() -> None:
+    settings = Settings(_env_file=None, environment=Environment.PRODUCTION)
+
+    with pytest.raises(ConfigurationError, match="allowed host"):
+        settings.validate_runtime()
+
+    settings.security = SecuritySettings(allowed_hosts=("agent.example.test",))
+    with pytest.raises(ConfigurationError, match="trusted proxy"):
+        settings.validate_runtime()
+
+
+def test_security_settings_normalize_and_validate_values() -> None:
+    settings = SecuritySettings(
+        allowed_hosts=(" Agent.Example.Test. ", "agent.example.test", "*.example.test"),
+        trusted_proxy_ips=("172.20.0.12", "172.20.0.0/16"),
+    )
+
+    assert settings.allowed_hosts == ("agent.example.test", "*.example.test")
+    assert settings.trusted_proxy_ips == ("172.20.0.12/32", "172.20.0.0/16")
+
+    with pytest.raises(ValueError, match="wildcard"):
+        SecuritySettings(allowed_hosts=("agent.*.example.test",))
+    with pytest.raises(ValueError, match="Trusted proxy IPs"):
+        SecuritySettings(trusted_proxy_ips=("not-an-ip",))
