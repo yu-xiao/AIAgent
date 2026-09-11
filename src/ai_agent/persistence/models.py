@@ -530,6 +530,8 @@ class AuditLog(Base):
     resource_id: Mapped[str | None] = mapped_column(String(100))
     trace_id: Mapped[UUID | None] = mapped_column(Uuid)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    integrity_hash: Mapped[str | None] = mapped_column(String(64))
+    integrity_key_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

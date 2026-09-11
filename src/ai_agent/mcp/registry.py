@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_agent.audit.service import AuditService
 from ai_agent.config import TokenEndpointAuthMethod
 from ai_agent.errors import (
     ConflictError,
@@ -17,7 +18,7 @@ from ai_agent.errors import (
 )
 from ai_agent.identity.service import MCP_SERVER_MANAGE, MCP_SERVER_VIEW, IdentityService
 from ai_agent.mcp.network_policy import McpNetworkPolicy
-from ai_agent.persistence.models import AuditLog, McpAuthMode, McpServerDefinition, McpTransport
+from ai_agent.persistence.models import McpAuthMode, McpServerDefinition, McpTransport
 
 
 class McpServerSpec(BaseModel):
@@ -128,10 +129,12 @@ class McpServerRegistry:
         session_factory: async_sessionmaker[AsyncSession],
         identities: IdentityService,
         network_policy: McpNetworkPolicy | None = None,
+        audit: AuditService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
         self._network_policy = network_policy or McpNetworkPolicy()
+        self._audit = audit or AuditService()
 
     async def create(
         self,
@@ -159,7 +162,7 @@ class McpServerRegistry:
             session.add(server)
             await session.flush()
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
                     action="mcp_server.created",
@@ -233,7 +236,7 @@ class McpServerRegistry:
             server.config_version += 1
             await session.flush()
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
                     action="mcp_server.updated",

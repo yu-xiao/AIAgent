@@ -77,7 +77,11 @@ def test_production_configuration_requires_governance_and_vault(tmp_path) -> Non
     with pytest.raises(ConfigurationError, match="governance"):
         settings.validate_runtime()
 
-    settings.governance = GovernanceSettings(enabled=True, quota=QuotaSettings(enabled=True))
+    settings.governance = GovernanceSettings(
+        enabled=True,
+        quota=QuotaSettings(enabled=True),
+        audit_integrity_key_file=str(secret),
+    )
     with pytest.raises(ConfigurationError, match="HashiCorp Vault"):
         settings.validate_runtime()
 

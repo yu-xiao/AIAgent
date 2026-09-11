@@ -8,13 +8,13 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_agent.audit.service import AuditService
 from ai_agent.config import RunLimitSettings
 from ai_agent.errors import ConflictError, ResourceNotFoundError, RunLimitError
 from ai_agent.identity.service import AGENT_USE, IdentityService
 from ai_agent.mcp.models import Citation as CitationValue
 from ai_agent.mcp.models import ToolInvocationRecord
 from ai_agent.persistence.models import (
-    AuditLog,
     Citation,
     Conversation,
     Message,
@@ -40,10 +40,12 @@ class ConversationService:
         session_factory: async_sessionmaker[AsyncSession],
         identities: IdentityService,
         limits: RunLimitSettings,
+        audit: AuditService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
         self._limits = limits
+        self._audit = audit or AuditService()
 
     async def recover_incomplete_runs(self, stale_before: datetime) -> list[Run]:
         """Fail abandoned running work and return durable queued work for resubmission."""
@@ -73,7 +75,7 @@ class ConversationService:
                     step.status = RunStatus.FAILED.value
                     step.completed_at = now
                 session.add(
-                    AuditLog(
+                    self._audit.record(
                         organization_id=run.organization_id,
                         actor_user_id=run.user_id,
                         action="run.recovered_as_failed",
@@ -105,7 +107,7 @@ class ConversationService:
             session.add(conversation)
             await session.flush()
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=user_id,
                     action="conversation.created",
@@ -222,7 +224,7 @@ class ConversationService:
             conversation.updated_at = datetime.now(UTC)
             await session.flush()
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=user_id,
                     action="run.queued",
@@ -265,7 +267,7 @@ class ConversationService:
             if run.status not in TERMINAL_RUN_STATUSES and run.cancellation_requested_at is None:
                 run.cancellation_requested_at = datetime.now(UTC)
                 session.add(
-                    AuditLog(
+                    self._audit.record(
                         organization_id=organization_id,
                         actor_user_id=user_id,
                         action="run.cancellation_requested",
@@ -387,7 +389,7 @@ class ConversationService:
                 )
             )
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=run.organization_id,
                     actor_user_id=run.user_id,
                     action="run.completed",
@@ -507,7 +509,7 @@ class ConversationService:
                     "cost_usd": cost_usd,
                 }
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=run.organization_id,
                     actor_user_id=run.user_id,
                     action=f"run.{status.value}",

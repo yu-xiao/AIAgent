@@ -192,6 +192,8 @@ class GovernanceSettings(BaseModel):
     shutdown_grace_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
     stale_run_after_seconds: int = Field(default=300, ge=90, le=86_400)
     audit_retention_days: int = Field(default=365, ge=30, le=3_650)
+    audit_integrity_key_file: str = ""
+    audit_integrity_key_id: str = "v1"
     max_concurrent_runs: int = Field(default=20, ge=1, le=10_000)
     quota: QuotaSettings = Field(default_factory=QuotaSettings)
 
@@ -397,11 +399,14 @@ class Settings(BaseSettings):
             raise ConfigurationError("Production Redis password must be loaded from a file.")
         if not self.model.api_key_file:
             raise ConfigurationError("Production model API key must be loaded from a file.")
+        if not self.governance.audit_integrity_key_file:
+            raise ConfigurationError("Production audit integrity key must be loaded from a file.")
         database = urlsplit(self.platform.database_url)
         if database.password:
             raise ConfigurationError("Production database URL must not contain a password.")
         _read_secret_file(self.platform.database_password_file, "database password")
         _read_secret_file(self.platform.redis_password_file, "Redis password")
+        _read_secret_file(self.governance.audit_integrity_key_file, "audit integrity key")
 
     def _load_secret_files(self) -> None:
         if self.model.api_key_file:
@@ -418,6 +423,14 @@ class Settings(BaseSettings):
         if not self.platform.redis_password_file:
             return None
         return _read_secret_file(self.platform.redis_password_file, "Redis password")
+
+    def audit_integrity_key(self) -> bytes | None:
+        if not self.governance.audit_integrity_key_file:
+            return None
+        return _read_secret_file(
+            self.governance.audit_integrity_key_file,
+            "audit integrity key",
+        ).encode("utf-8")
 
 
 def _validate_client_auth(

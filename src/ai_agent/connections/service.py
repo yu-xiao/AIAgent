@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_agent.audit.service import AuditService
 from ai_agent.config import PlatformSettings, TokenEndpointAuthMethod
 from ai_agent.credentials.vault import Credential, CredentialVault
 from ai_agent.errors import (
@@ -31,7 +32,6 @@ from ai_agent.oauth.client import AuthorizationCodeClient, AuthorizationTransact
 from ai_agent.oauth.models import OAuthToken, OidcProviderMetadata
 from ai_agent.oauth.validator import OidcIdTokenValidator
 from ai_agent.persistence.models import (
-    AuditLog,
     ConnectionOwnership,
     ConnectionStatus,
     ConnectionToolGrant,
@@ -56,6 +56,7 @@ class ConnectionService:
         default_client_id: str = "ai-agent-web",
         default_timeout_seconds: float = 10.0,
         signing_algorithms: tuple[str, ...] = ("RS256",),
+        audit: AuditService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
@@ -69,6 +70,7 @@ class ConnectionService:
             signing_algorithms=signing_algorithms,
             timeout_seconds=default_timeout_seconds,
         )
+        self._audit = audit or AuditService()
 
     async def begin_personal_authorization(
         self,
@@ -112,7 +114,7 @@ class ConnectionService:
                 )
             )
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=user_id,
                     action="connection.authorization_started",
@@ -245,7 +247,7 @@ class ConnectionService:
                 connection.credential_reference = access_reference
                 connection.expires_at = credential.expires_at
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=grant.organization_id,
                     actor_user_id=user_id,
                     action="connection.authorization_succeeded",
@@ -368,7 +370,7 @@ class ConnectionService:
                 session.add(connection)
                 await session.flush()
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
                     action=(
@@ -442,7 +444,7 @@ class ConnectionService:
             if credential_reference:
                 credential_reference.status = "revocation_pending"
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=user_id,
                     action="connection.disconnected",
@@ -517,7 +519,7 @@ class ConnectionService:
             connection.expires_at = credential.expires_at
             connection.status = ConnectionStatus.ACTIVE
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=user_id,
                     action="connection.refreshed",

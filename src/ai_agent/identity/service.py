@@ -8,9 +8,9 @@ from uuid import UUID
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_agent.audit.service import AuditService
 from ai_agent.errors import AuthorizationError, ConflictError, ResourceNotFoundError
 from ai_agent.persistence.models import (
-    AuditLog,
     MemberRole,
     Organization,
     OrganizationMember,
@@ -69,8 +69,13 @@ class OrganizationAccess:
 
 
 class IdentityService:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        audit: AuditService | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._audit = audit or AuditService()
 
     async def upsert_oidc_user(
         self, *, issuer: str, subject: str, display_name: str, email: str | None
@@ -156,7 +161,7 @@ class IdentityService:
                 + [MemberRole(member_id=member.id, role_id=admin.id)]
             )
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization.id,
                     actor_user_id=user_id,
                     action="organization.created",
@@ -265,7 +270,7 @@ class IdentityService:
             await session.flush()
             session.add(MemberRole(member_id=member.id, role_id=role.id))
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
                     action="organization.member_added",
@@ -323,7 +328,7 @@ class IdentityService:
             await session.execute(delete(MemberRole).where(MemberRole.member_id == member_id))
             session.add_all([MemberRole(member_id=member_id, role_id=role.id) for role in roles])
             session.add(
-                AuditLog(
+                self._audit.record(
                     organization_id=organization_id,
                     actor_user_id=actor_id,
                     action="organization.member_roles_updated",

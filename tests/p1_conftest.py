@@ -10,6 +10,7 @@ import pytest
 from pydantic import SecretStr
 
 from ai_agent.api import create_app
+from ai_agent.audit.service import AuditService
 from ai_agent.config import ModelSettings, OidcSettings, PlatformSettings, Settings
 from ai_agent.conversations.service import ConversationService
 from ai_agent.identity.oidc import OidcLoginService
@@ -94,8 +95,14 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
         ),
     )
     sessions = MemorySessionStore()
-    identities = IdentityService(database.session_factory)
-    conversations = ConversationService(database.session_factory, identities, settings.limits)
+    audit = AuditService(b"test-audit-key", key_id="test-v1")
+    identities = IdentityService(database.session_factory, audit)
+    conversations = ConversationService(
+        database.session_factory,
+        identities,
+        settings.limits,
+        audit,
+    )
     backend = MemoryRunBackend()
     provider = FakeModelProvider()
     oidc = OidcLoginService(settings.oidc, settings.platform, sessions, identities)
@@ -118,6 +125,7 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
         control=backend,
         executor=executor,
         provider=provider,
+        audit=audit,
     )
     user = await identities.upsert_oidc_user(
         issuer=settings.oidc.issuer,

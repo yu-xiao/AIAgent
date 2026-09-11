@@ -7,10 +7,13 @@ import asyncio
 import json
 import sys
 from collections.abc import Sequence
+from datetime import datetime
+from uuid import UUID
 
 import uvicorn
 from redis.asyncio import Redis
 
+from ai_agent.audit.service import AuditService
 from ai_agent.config import Settings
 from ai_agent.errors import AiAgentError, ConfigurationError
 from ai_agent.governance.quota import RedisRunQuota
@@ -25,7 +28,6 @@ from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.oauth.client import DiscoveryClient
 from ai_agent.observability.logging import configure_logging
 from ai_agent.persistence import Database
-from ai_agent.persistence.models import AuditLog
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete matching records; omission performs a dry run",
     )
+
+    verify_audit = subparsers.add_parser("verify-audit", help="Verify audit record integrity")
+    verify_audit.add_argument("--organization-id", type=UUID)
+    verify_audit.add_argument("--created-after", type=_parse_datetime)
+    verify_audit.add_argument("--created-before", type=_parse_datetime)
 
     runs = subparsers.add_parser("runs", help="Operate the distributed Run switch")
     runs.add_argument("action", choices=("enable", "disable", "status"))
@@ -102,6 +109,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "prune-audit":
             return asyncio.run(_prune_audit(settings, execute=args.execute))
+        if args.command == "verify-audit":
+            return asyncio.run(
+                _verify_audit(
+                    settings,
+                    organization_id=args.organization_id,
+                    created_after=args.created_after,
+                    created_before=args.created_before,
+                )
+            )
         if args.command == "runs":
             return asyncio.run(_operate_runs(settings, args.action))
     except (AiAgentError, ValueError) as exc:
@@ -118,8 +134,9 @@ async def _prune_audit(settings: Settings, *, execute: bool) -> int:
         settings.platform.database_url,
         password=settings.database_password(),
     )
+    audit = _audit_service(settings)
     try:
-        result = await AuditRetentionService(database.session_factory).prune(
+        result = await AuditRetentionService(database.session_factory, audit).prune(
             settings.governance.audit_retention_days,
             execute=execute,
         )
@@ -133,6 +150,45 @@ async def _prune_audit(settings: Settings, *, execute: bool) -> int:
     finally:
         await database.dispose()
     return 0
+
+
+async def _verify_audit(
+    settings: Settings,
+    *,
+    organization_id: UUID | None,
+    created_after: datetime | None,
+    created_before: datetime | None,
+) -> int:
+    settings.validate_runtime()
+    if not settings.platform.enabled:
+        raise ConfigurationError("Audit verification requires the platform to be enabled.")
+    database = Database(
+        settings.platform.database_url,
+        password=settings.database_password(),
+    )
+    try:
+        async with database.session_factory() as session:
+            result = await _audit_service(settings).verify(
+                session,
+                organization_id=organization_id,
+                created_after=created_after,
+                created_before=created_before,
+            )
+        _print_json(
+            {
+                "status": "valid"
+                if result.invalid == 0 and result.key_mismatch == 0
+                else "invalid",
+                "checked": result.checked,
+                "valid": result.valid,
+                "unsigned": result.unsigned,
+                "key_mismatch": result.key_mismatch,
+                "invalid": result.invalid,
+            }
+        )
+        return 1 if result.invalid > 0 or result.key_mismatch > 0 else 0
+    finally:
+        await database.dispose()
 
 
 async def _operate_runs(settings: Settings, action: str) -> int:
@@ -150,13 +206,14 @@ async def _operate_runs(settings: Settings, action: str) -> int:
         settings.platform.database_url,
         password=settings.database_password(),
     )
+    audit = _audit_service(settings)
     try:
         if action == "disable":
             await quota.disable_runs()
-            await _write_control_audit(database, "governance.runs_disabled")
+            await _write_control_audit(database, audit, "governance.runs_disabled")
         elif action == "enable":
             await quota.enable_runs()
-            await _write_control_audit(database, "governance.runs_enabled")
+            await _write_control_audit(database, audit, "governance.runs_enabled")
         _print_json({"runs_enabled": await quota.runs_enabled()})
     finally:
         await redis.aclose()
@@ -164,10 +221,10 @@ async def _operate_runs(settings: Settings, action: str) -> int:
     return 0
 
 
-async def _write_control_audit(database: Database, action: str) -> None:
+async def _write_control_audit(database: Database, audit: AuditService, action: str) -> None:
     async with database.session_factory() as session, session.begin():
         session.add(
-            AuditLog(
+            audit.record(
                 organization_id=None,
                 actor_user_id=None,
                 action=action,
@@ -177,6 +234,23 @@ async def _write_control_audit(database: Database, action: str) -> None:
                 details={"source": "operator_cli"},
             )
         )
+
+
+def _audit_service(settings: Settings) -> AuditService:
+    return AuditService(
+        settings.audit_integrity_key(),
+        key_id=settings.governance.audit_integrity_key_id,
+    )
+
+
+def _parse_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Datetime must be ISO 8601 format.") from exc
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("Datetime must include a UTC offset.")
+    return parsed
 
 
 async def _probe_oidc(settings: Settings) -> int:

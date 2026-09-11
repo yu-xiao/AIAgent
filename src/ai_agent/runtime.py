@@ -11,6 +11,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
+from ai_agent.audit.service import AuditService
 from ai_agent.config import CredentialVaultBackend, Settings
 from ai_agent.connections.service import ConnectionService
 from ai_agent.conversations.service import ConversationService
@@ -35,7 +36,6 @@ from ai_agent.models import ModelProvider
 from ai_agent.models.openai_compatible import OpenAICompatibleProvider
 from ai_agent.permission_system.service import PermissionSystemService
 from ai_agent.persistence import Database
-from ai_agent.persistence.models import AuditLog
 from ai_agent.runs.events import RedisRunControl, RedisRunEventBus, RunControl, RunEventBus
 from ai_agent.runs.executor import RunExecutor
 
@@ -54,6 +54,7 @@ class AppServices:
     control: RunControl
     executor: RunExecutor
     provider: ModelProvider
+    audit: AuditService
     quota: RedisRunQuota | None = None
     vault: CredentialVault | None = None
     mcp_registry: McpServerRegistry | None = None
@@ -108,8 +109,14 @@ def build_services(settings: Settings) -> AppServices:
         password=settings.redis_password(),
     )
     sessions = RedisSessionStore(redis)
-    identities = IdentityService(database.session_factory)
-    conversations = ConversationService(database.session_factory, identities, settings.limits)
+    audit = AuditService(
+        settings.audit_integrity_key(),
+        key_id=settings.governance.audit_integrity_key_id,
+    )
+    identities = IdentityService(database.session_factory, audit)
+    conversations = ConversationService(
+        database.session_factory, identities, settings.limits, audit
+    )
     events = RedisRunEventBus(redis)
     control = RedisRunControl(redis)
     provider = OpenAICompatibleProvider(settings.model)
@@ -129,6 +136,7 @@ def build_services(settings: Settings) -> AppServices:
         database.session_factory,
         identities,
         network_policy=network_policy,
+        audit=audit,
     )
     connections = ConnectionService(
         database.session_factory,
@@ -138,6 +146,7 @@ def build_services(settings: Settings) -> AppServices:
         settings.platform,
         default_timeout_seconds=settings.mcp_gateway.default_timeout_seconds,
         signing_algorithms=settings.oidc.signing_algorithms,
+        audit=audit,
     )
     catalog = ToolCatalogService(
         mcp_registry,
@@ -151,7 +160,7 @@ def build_services(settings: Settings) -> AppServices:
         catalog,
         rate_limiter=RedisSlidingWindowRateLimiter(redis),
         circuit_breaker=RedisCircuitBreaker(redis),
-        audit=_tool_audit_writer(database.session_factory),
+        audit=_tool_audit_writer(database.session_factory, audit),
     )
     permission_system = PermissionSystemService(
         gateway,
@@ -200,6 +209,7 @@ def build_services(settings: Settings) -> AppServices:
         control=control,
         executor=executor,
         provider=provider,
+        audit=audit,
         quota=quota,
         vault=vault,
         mcp_registry=mcp_registry,
@@ -210,7 +220,10 @@ def build_services(settings: Settings) -> AppServices:
     )
 
 
-def _tool_audit_writer(session_factory: Any) -> Callable[..., Awaitable[None]]:
+def _tool_audit_writer(
+    session_factory: Any,
+    audit: AuditService,
+) -> Callable[..., Awaitable[None]]:
     async def write(
         *,
         context: Any,
@@ -222,7 +235,7 @@ def _tool_audit_writer(session_factory: Any) -> Callable[..., Awaitable[None]]:
     ) -> None:
         async with session_factory() as session, session.begin():
             session.add(
-                AuditLog(
+                audit.record(
                     organization_id=context.organization_id,
                     actor_user_id=context.user_id,
                     action=f"tool.{status}",
