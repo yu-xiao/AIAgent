@@ -105,6 +105,19 @@ class IdentityService:
                 raise ResourceNotFoundError("Authenticated platform user is unavailable.")
             return user
 
+    async def record_logout(self, user_id: UUID) -> None:
+        async with self._session_factory() as session, session.begin():
+            session.add(
+                self._audit.record(
+                    organization_id=None,
+                    actor_user_id=user_id,
+                    action="auth.logout",
+                    resource_type="session",
+                    resource_id=None,
+                    details={"source": "web"},
+                )
+            )
+
     async def require_tool_access(
         self, user_id: UUID, organization_id: UUID, system_code: str
     ) -> None:
@@ -177,7 +190,8 @@ class IdentityService:
             result = await session.scalars(
                 select(Organization)
                 .join(OrganizationMember)
-                .where(OrganizationMember.user_id == user_id)
+                .join(User, User.id == OrganizationMember.user_id)
+                .where(OrganizationMember.user_id == user_id, User.is_active.is_(True))
                 .order_by(Organization.name, Organization.id)
             )
             return list(result)
@@ -193,9 +207,11 @@ class IdentityService:
                         OrganizationMember,
                         OrganizationMember.organization_id == Organization.id,
                     )
+                    .join(User, User.id == OrganizationMember.user_id)
                     .where(
                         Organization.id == organization_id,
                         OrganizationMember.user_id == user_id,
+                        User.is_active.is_(True),
                     )
                 )
             ).one_or_none()
@@ -248,8 +264,11 @@ class IdentityService:
     ) -> OrganizationMember:
         await self.access(actor_id, organization_id, ORGANIZATION_MEMBER_MANAGE)
         async with self._session_factory() as session, session.begin():
-            if await session.get(User, user_id) is None:
+            user = await session.get(User, user_id)
+            if user is None:
                 raise ResourceNotFoundError("Platform user not found.")
+            if not user.is_active:
+                raise ResourceNotFoundError("Platform user is not active.")
             existing = await session.scalar(
                 select(OrganizationMember).where(
                     OrganizationMember.organization_id == organization_id,
@@ -281,6 +300,49 @@ class IdentityService:
             )
             return member
 
+    async def remove_member(
+        self, actor_id: UUID, organization_id: UUID, member_id: UUID
+    ) -> None:
+        await self.access(actor_id, organization_id, ORGANIZATION_MEMBER_MANAGE)
+        async with self._session_factory() as session, session.begin():
+            member = await session.scalar(
+                select(OrganizationMember).where(
+                    OrganizationMember.id == member_id,
+                    OrganizationMember.organization_id == organization_id,
+                )
+            )
+            if member is None:
+                raise ResourceNotFoundError("Organization member not found.")
+            admin_count = await session.scalar(
+                select(func.count(func.distinct(MemberRole.member_id)))
+                .select_from(MemberRole)
+                .join(Role, Role.id == MemberRole.role_id)
+                .where(
+                    Role.organization_id == organization_id,
+                    Role.code == ADMIN_ROLE,
+                )
+            )
+            member_is_admin = await session.scalar(
+                select(func.count())
+                .select_from(MemberRole)
+                .join(Role, Role.id == MemberRole.role_id)
+                .where(MemberRole.member_id == member_id, Role.code == ADMIN_ROLE)
+            )
+            if member_is_admin and admin_count == 1:
+                raise ConflictError("The organization must retain at least one administrator.")
+            await session.execute(delete(MemberRole).where(MemberRole.member_id == member_id))
+            await session.delete(member)
+            session.add(
+                self._audit.record(
+                    organization_id=organization_id,
+                    actor_user_id=actor_id,
+                    action="organization.member_removed",
+                    resource_type="organization_member",
+                    resource_id=str(member_id),
+                    details={"user_id": str(member.user_id)},
+                )
+            )
+
     async def set_member_roles(
         self,
         actor_id: UUID,
@@ -300,6 +362,9 @@ class IdentityService:
             )
             if member is None:
                 raise ResourceNotFoundError("Organization member not found.")
+            member_user = await session.get(User, member.user_id)
+            if member_user is None or not member_user.is_active:
+                raise ResourceNotFoundError("Platform user is not active.")
             roles = list(
                 await session.scalars(
                     select(Role).where(

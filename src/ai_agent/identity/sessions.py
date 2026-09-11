@@ -38,6 +38,8 @@ class SessionStore(Protocol):
 
     async def delete_session(self, session_id: str) -> None: ...
 
+    async def delete_user_sessions(self, user_id: UUID) -> int: ...
+
     async def ping(self) -> None: ...
 
 
@@ -69,6 +71,7 @@ class RedisSessionStore:
             json.dumps({"user_id": str(user_id), "csrf_token": session.csrf_token}),
             ex=ttl_seconds,
         )
+        await cast(Awaitable[int], self._redis.sadd(f"user-sessions:{user_id}", session_id))
         return session_id, session
 
     async def get_session(self, session_id: str) -> AuthSession | None:
@@ -79,7 +82,28 @@ class RedisSessionStore:
         return AuthSession(user_id=UUID(payload["user_id"]), csrf_token=payload["csrf_token"])
 
     async def delete_session(self, session_id: str) -> None:
-        await self._redis.delete(f"session:{session_id}")
+        key = f"session:{session_id}"
+        value = await self._redis.get(key)
+        await cast(Awaitable[int], self._redis.delete(key))
+        if value is not None:
+            payload = json.loads(_decode(value))
+            await cast(
+                Awaitable[int],
+                self._redis.srem(f"user-sessions:{payload['user_id']}", session_id),
+            )
+
+    async def delete_user_sessions(self, user_id: UUID) -> int:
+        index_key = f"user-sessions:{user_id}"
+        session_ids = await cast(Awaitable[set[bytes | str]], self._redis.smembers(index_key))
+        if not session_ids:
+            return 0
+        decoded_ids = [_decode(item) for item in session_ids]
+        deleted = await cast(
+            Awaitable[int],
+            self._redis.delete(*(f"session:{session_id}" for session_id in decoded_ids)),
+        )
+        await cast(Awaitable[int], self._redis.delete(index_key))
+        return int(deleted)
 
     async def ping(self) -> None:
         await cast(Awaitable[bool], self._redis.ping())
@@ -91,6 +115,7 @@ class MemorySessionStore:
     def __init__(self) -> None:
         self.transactions: dict[str, StoredOAuthTransaction] = {}
         self.sessions: dict[str, AuthSession] = {}
+        self.user_sessions: dict[UUID, set[str]] = {}
 
     async def save_oauth_transaction(
         self, transaction: StoredOAuthTransaction, ttl_seconds: int
@@ -106,13 +131,26 @@ class MemorySessionStore:
         session_id = secrets.token_urlsafe(32)
         session = AuthSession(user_id=user_id, csrf_token=secrets.token_urlsafe(32))
         self.sessions[session_id] = session
+        self.user_sessions.setdefault(user_id, set()).add(session_id)
         return session_id, session
 
     async def get_session(self, session_id: str) -> AuthSession | None:
         return self.sessions.get(session_id)
 
     async def delete_session(self, session_id: str) -> None:
-        self.sessions.pop(session_id, None)
+        session = self.sessions.pop(session_id, None)
+        if session is not None:
+            sessions = self.user_sessions.get(session.user_id)
+            if sessions is not None:
+                sessions.discard(session_id)
+                if not sessions:
+                    self.user_sessions.pop(session.user_id, None)
+
+    async def delete_user_sessions(self, user_id: UUID) -> int:
+        session_ids = self.user_sessions.pop(user_id, set())
+        for session_id in session_ids:
+            self.sessions.pop(session_id, None)
+        return len(session_ids)
 
     async def ping(self) -> None:
         return None

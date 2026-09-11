@@ -9,6 +9,7 @@ from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
+from ai_agent.errors import ResourceNotFoundError
 from ai_agent.identity.sessions import AuthSession
 
 
@@ -38,6 +39,15 @@ async def current_identity(request: Request) -> RequestIdentity:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session is missing or expired.",
         )
+    try:
+        await request.app.state.services.identities.get_user(auth_session.user_id)
+    except ResourceNotFoundError as exc:
+        # Revoking all sessions makes a deactivated account fail closed across devices.
+        await request.app.state.services.sessions.delete_user_sessions(auth_session.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session is missing or expired.",
+        ) from exc
     return RequestIdentity(session_id=session_id, session=auth_session)
 
 

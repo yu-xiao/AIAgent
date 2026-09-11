@@ -99,6 +99,7 @@ async def logout(
     identity: CurrentIdentity,
 ) -> Response:
     await require_csrf(identity, request.headers.get("X-CSRF-Token"))
+    await request.app.state.services.identities.record_logout(identity.session.user_id)
     await request.app.state.services.sessions.delete_session(identity.session_id)
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     response.delete_cookie(request.app.state.settings.platform.session_cookie_name, path="/")
@@ -233,5 +234,25 @@ async def update_member_roles(
         organization_id,
         member_id,
         payload.roles,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete(
+    "/organizations/current/members/{member_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["organizations"],
+)
+async def remove_member(
+    member_id: UUID,
+    request: Request,
+    identity: CurrentIdentity,
+    organization_id: OrganizationId,
+) -> Response:
+    await require_csrf(identity, request.headers.get("X-CSRF-Token"))
+    await request.app.state.services.identities.remove_member(
+        identity.session.user_id,
+        organization_id,
+        member_id,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
