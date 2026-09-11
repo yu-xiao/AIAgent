@@ -467,11 +467,11 @@ class ConversationService:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cost_usd: float | None = None,
-    ) -> None:
+    ) -> bool:
         async with self._session_factory() as session, session.begin():
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
             if run is None or run.status in TERMINAL_RUN_STATUSES:
-                return
+                return False
             now = datetime.now(UTC)
             run.status = status
             run.error_code = error_code
@@ -517,6 +517,7 @@ class ConversationService:
                     details={"error_code": error_code, **usage_details},
                 )
             )
+            return True
 
 
 def _deduplicate_citations(items: list[CitationValue]) -> list[CitationValue]:

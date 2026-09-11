@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -19,9 +20,10 @@ from ai_agent.identity.dependencies import (
     OrganizationId,
     require_csrf,
 )
-from ai_agent.persistence.models import Conversation, Message, Run, RunStatus
+from ai_agent.persistence.models import Conversation, Message, Run
 
 router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
 _EVENT_ID = re.compile(r"^[0-9]+-[0-9]+$")
 Offset = Annotated[int, Query(ge=0)]
 Limit = Annotated[int, Query(ge=1, le=100)]
@@ -220,28 +222,60 @@ async def create_message_run(
             await services.quota.rollback(quota_lease)
         raise
     if created:
-        await services.events.publish(
-            run.id,
-            "run.queued",
-            {"trace_id": str(run.trace_id)},
-        )
         try:
-            services.executor.submit(run.id, quota_lease)
-        except RuntimeError as exc:
-            if services.quota is not None and quota_lease is not None:
-                await services.quota.rollback(quota_lease)
-            await services.conversations.finish_run_with_error(
+            await services.events.publish(
                 run.id,
-                RunStatus.FAILED,
+                "run.queued",
+                {"trace_id": str(run.trace_id)},
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish queued Agent Run event",
+                extra={"run_id": str(run.id)},
+            )
+        try:
+            accepted = services.executor.submit(run.id, quota_lease)
+        except RuntimeError as exc:
+            await services.executor.reject_submission(
+                run.id,
+                str(run.trace_id),
                 "service_draining",
                 "Run was rejected because the service is draining.",
+                quota_lease,
             )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Agent Runs are draining for service shutdown.",
             ) from exc
+        except Exception as exc:
+            logger.exception("Failed to submit Agent Run", extra={"run_id": str(run.id)})
+            await services.executor.reject_submission(
+                run.id,
+                str(run.trace_id),
+                "submission_failed",
+                "Run could not be submitted for execution.",
+                quota_lease,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Agent Runs are temporarily unavailable.",
+            ) from exc
+        if not accepted and services.quota is not None and quota_lease is not None:
+            try:
+                await services.quota.rollback(quota_lease)
+            except Exception:
+                logger.exception(
+                    "Failed to roll back duplicate Run quota",
+                    extra={"run_id": str(run.id)},
+                )
     elif services.quota is not None and quota_lease is not None:
-        await services.quota.rollback(quota_lease)
+        try:
+            await services.quota.rollback(quota_lease)
+        except Exception:
+            logger.exception(
+                "Failed to roll back duplicate Run quota",
+                extra={"run_id": str(run.id)},
+            )
     return _run_view(run)
 
 

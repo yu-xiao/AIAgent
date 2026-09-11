@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,6 +39,8 @@ from ai_agent.persistence.models import AuditLog
 from ai_agent.runs.events import RedisRunControl, RedisRunEventBus, RunControl, RunEventBus
 from ai_agent.runs.executor import RunExecutor
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class AppServices:
@@ -70,7 +73,21 @@ class AppServices:
             datetime.now(UTC) - timedelta(seconds=settings.governance.stale_run_after_seconds)
         )
         for run in queued:
-            self.executor.submit(run.id)
+            try:
+                accepted = self.executor.submit(run.id)
+                if not accepted:
+                    logger.debug(
+                        "Skipped duplicate recovered Agent Run",
+                        extra={"run_id": str(run.id)},
+                    )
+            except Exception:
+                logger.exception("Failed to recover Agent Run", extra={"run_id": str(run.id)})
+                await self.executor.reject_submission(
+                    run.id,
+                    str(run.trace_id),
+                    "recovery_submission_failed",
+                    "Run could not be resumed after service startup.",
+                )
 
     async def close(self) -> None:
         await self.executor.close()
@@ -170,6 +187,7 @@ def build_services(settings: Settings) -> AppServices:
         personal_tools_only=settings.permission_system.enabled,
         quota=quota,
         shutdown_grace_seconds=settings.governance.shutdown_grace_seconds,
+        max_concurrent_runs=settings.governance.max_concurrent_runs,
     )
     return AppServices(
         database=database,

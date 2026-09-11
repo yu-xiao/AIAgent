@@ -192,6 +192,7 @@ class GovernanceSettings(BaseModel):
     shutdown_grace_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
     stale_run_after_seconds: int = Field(default=300, ge=90, le=86_400)
     audit_retention_days: int = Field(default=365, ge=30, le=3_650)
+    max_concurrent_runs: int = Field(default=20, ge=1, le=10_000)
     quota: QuotaSettings = Field(default_factory=QuotaSettings)
 
 

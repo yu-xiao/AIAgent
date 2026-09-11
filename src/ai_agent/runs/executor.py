@@ -47,6 +47,7 @@ class RunExecutor:
         personal_tools_only: bool = False,
         quota: RedisRunQuota | None = None,
         shutdown_grace_seconds: float = 30.0,
+        max_concurrent_runs: int = 20,
     ) -> None:
         self._conversations = conversations
         self._provider = provider
@@ -61,23 +62,51 @@ class RunExecutor:
         self._personal_tools_only = personal_tools_only
         self._quota = quota
         self._shutdown_grace_seconds = shutdown_grace_seconds
-        self._tasks: set[asyncio.Task[None]] = set()
+        if max_concurrent_runs < 1:
+            raise ValueError("max_concurrent_runs must be positive.")
+        self._tasks: dict[UUID, asyncio.Task[None]] = {}
+        self._capacity = asyncio.Semaphore(max_concurrent_runs)
         self._closed = False
 
     @property
     def accepting(self) -> bool:
         return not self._closed
 
-    def submit(self, run_id: UUID, quota_lease: RunQuotaLease | None = None) -> None:
+    def submit(self, run_id: UUID, quota_lease: RunQuotaLease | None = None) -> bool:
         if self._closed:
             raise RuntimeError("Run executor is closed.")
-        task = asyncio.create_task(self._execute(run_id, quota_lease), name=f"agent-run-{run_id}")
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        existing = self._tasks.get(run_id)
+        if existing is not None and not existing.done():
+            return False
+        task = asyncio.create_task(
+            self._execute_with_capacity(run_id, quota_lease), name=f"agent-run-{run_id}"
+        )
+        self._tasks[run_id] = task
+        task.add_done_callback(self._on_task_done)
+        return True
+
+    async def _execute_with_capacity(
+        self,
+        run_id: UUID,
+        quota_lease: RunQuotaLease | None = None,
+    ) -> None:
+        async with self._capacity:
+            await self._execute(run_id, quota_lease)
+
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
+        for run_id, tracked in list(self._tasks.items()):
+            if tracked is task:
+                self._tasks.pop(run_id, None)
+                break
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.error("Unhandled Agent Run task failure", exc_info=exception)
 
     async def close(self) -> None:
         self._closed = True
-        tasks = set(self._tasks)
+        tasks = set(self._tasks.values())
         if not tasks:
             return
         _, pending = await asyncio.wait(tasks, timeout=self._shutdown_grace_seconds)
@@ -95,12 +124,10 @@ class RunExecutor:
             run = await self._conversations.claim_run(run_id)
         except Exception:
             logger.exception("Failed to claim Agent Run", extra={"run_id": str(run_id)})
-            if self._quota is not None and quota_lease is not None:
-                await self._quota.rollback(quota_lease)
+            await self._rollback_quota(quota_lease, run_id)
             return
         if run is None:
-            if self._quota is not None and quota_lease is not None:
-                await self._quota.rollback(quota_lease)
+            await self._rollback_quota(quota_lease, run_id)
             return
         trace_id = str(run.trace_id)
         metered_usage: tuple[int, int, float] | None = None
@@ -123,7 +150,7 @@ class RunExecutor:
                         trace_id,
                     )
                     return
-            await self._events.publish(run_id, "run.started", {"trace_id": trace_id})
+            await self._publish_event(run_id, "run.started", {"trace_id": trace_id})
             if await self._control.is_cancel_requested(run_id):
                 raise RunCancelledError
             stored_messages = await self._conversations.load_run_messages(run)
@@ -134,7 +161,7 @@ class RunExecutor:
             async def on_delta(delta: str) -> None:
                 if await self._control.is_cancel_requested(run_id):
                     raise RunCancelledError
-                await self._events.publish(
+                await self._publish_event(
                     run_id,
                     "message.delta",
                     {"delta": delta, "trace_id": trace_id},
@@ -224,7 +251,7 @@ class RunExecutor:
             if not completed:
                 return
             for invocation in result.tool_invocations:
-                await self._events.publish(
+                await self._publish_event(
                     run_id,
                     "run.tool_invocation",
                     {
@@ -237,13 +264,13 @@ class RunExecutor:
                     },
                 )
             for citation in result.citations:
-                await self._events.publish(
+                await self._publish_event(
                     run_id,
                     "run.citation",
                     {"citation": citation.model_dump(mode="json"), "trace_id": trace_id},
                 )
             RUNS_TOTAL.labels(status=RunStatus.COMPLETED.value).inc()
-            await self._events.publish(
+            await self._publish_event(
                 run_id,
                 "run.completed",
                 {
@@ -288,12 +315,18 @@ class RunExecutor:
                 trace_id,
             )
         except asyncio.CancelledError:
-            await self._conversations.finish_run_with_error(
-                run_id,
-                RunStatus.FAILED,
-                "service_shutdown",
-                "Run stopped because the service shut down.",
-            )
+            try:
+                await self._conversations.finish_run_with_error(
+                    run_id,
+                    RunStatus.FAILED,
+                    "service_shutdown",
+                    "Run stopped because the service shut down.",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to mark Agent Run as stopped during shutdown",
+                    extra={"run_id": str(run_id)},
+                )
             raise
         except Exception:
             logger.exception("Unexpected Agent Run failure", extra={"run_id": str(run_id)})
@@ -305,9 +338,8 @@ class RunExecutor:
                 trace_id,
             )
         finally:
-            if self._quota is not None and quota_lease is not None:
-                await self._quota.abandon(quota_lease)
-            await self._control.clear(run_id)
+            await self._abandon_quota(quota_lease, run_id)
+            await self._clear_control(run_id)
 
     def _bounded_messages(self, stored: list[Message]) -> list[ModelMessage]:
         system_prompt = self._model_settings.system_prompt
@@ -349,6 +381,83 @@ class RunExecutor:
         ) / 1_000_000
         return round(value, 8)
 
+    async def reject_submission(
+        self,
+        run_id: UUID,
+        trace_id: str,
+        error_code: str,
+        message: str,
+        quota_lease: RunQuotaLease | None = None,
+    ) -> None:
+        await self._rollback_quota(quota_lease, run_id)
+        try:
+            finished = await self._conversations.finish_run_with_error(
+                run_id,
+                RunStatus.FAILED,
+                error_code,
+                message,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist rejected Agent Run",
+                extra={"run_id": str(run_id), "error_code": error_code},
+            )
+            return
+        if finished:
+            RUNS_TOTAL.labels(status=RunStatus.FAILED.value).inc()
+            await self._publish_event(
+                run_id,
+                "run.failed",
+                {"trace_id": trace_id, "error_code": error_code, "message": message},
+                terminal=True,
+            )
+
+    async def _rollback_quota(
+        self,
+        quota_lease: RunQuotaLease | None,
+        run_id: UUID,
+    ) -> None:
+        if self._quota is None or quota_lease is None:
+            return
+        try:
+            await self._quota.rollback(quota_lease)
+        except Exception:
+            logger.exception("Failed to roll back Run quota", extra={"run_id": str(run_id)})
+
+    async def _abandon_quota(
+        self,
+        quota_lease: RunQuotaLease | None,
+        run_id: UUID,
+    ) -> None:
+        if self._quota is None or quota_lease is None:
+            return
+        try:
+            await self._quota.abandon(quota_lease)
+        except Exception:
+            logger.exception("Failed to release Run quota lease", extra={"run_id": str(run_id)})
+
+    async def _clear_control(self, run_id: UUID) -> None:
+        try:
+            await self._control.clear(run_id)
+        except Exception:
+            logger.exception("Failed to clear Run control state", extra={"run_id": str(run_id)})
+
+    async def _publish_event(
+        self,
+        run_id: UUID,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        terminal: bool = False,
+    ) -> None:
+        try:
+            await self._events.publish(run_id, event_type, payload, terminal=terminal)
+        except Exception:
+            logger.exception(
+                "Failed to publish Agent Run event",
+                extra={"run_id": str(run_id), "event_type": event_type},
+            )
+
     async def _finish_error(
         self,
         run_id: UUID,
@@ -358,27 +467,36 @@ class RunExecutor:
         trace_id: str,
         metered_usage: tuple[int, int, float] | None = None,
     ) -> None:
-        if metered_usage is None:
-            await self._conversations.finish_run_with_error(
-                run_id,
-                status,
-                error_code,
-                message,
+        try:
+            if metered_usage is None:
+                finished = await self._conversations.finish_run_with_error(
+                    run_id,
+                    status,
+                    error_code,
+                    message,
+                )
+            else:
+                finished = await self._conversations.finish_run_with_error(
+                    run_id,
+                    status,
+                    error_code,
+                    message,
+                    provider=self._provider.provider_name,
+                    model=self._provider.model_name,
+                    input_tokens=metered_usage[0],
+                    output_tokens=metered_usage[1],
+                    cost_usd=metered_usage[2],
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist Agent Run failure",
+                extra={"run_id": str(run_id), "error_code": error_code},
             )
-        else:
-            await self._conversations.finish_run_with_error(
-                run_id,
-                status,
-                error_code,
-                message,
-                provider=self._provider.provider_name,
-                model=self._provider.model_name,
-                input_tokens=metered_usage[0],
-                output_tokens=metered_usage[1],
-                cost_usd=metered_usage[2],
-            )
+            return
+        if not finished:
+            return
         RUNS_TOTAL.labels(status=status.value).inc()
-        await self._events.publish(
+        await self._publish_event(
             run_id,
             f"run.{status.value}",
             {"trace_id": trace_id, "error_code": error_code, "message": message},
