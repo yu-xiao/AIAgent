@@ -1,0 +1,174 @@
+name: Release Container
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable image tag, for example v0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+  security-events: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  LOCAL_IMAGE: enterprise-ai-agent:release-candidate
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${REQUESTED_VERSION}"
+          fi
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Require a commit from master
+        shell: bash
+        run: |
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/master; then
+            echo "Release commit must be reachable from origin/master." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=sha,prefix=sha-
+
+      - name: Build release candidate locally
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.tag }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.run_started_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate candidate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.LOCAL_IMAGE }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-${{ steps.version.outputs.tag }}.spdx.json
+          upload-release-assets: false
+
+      - name: Scan release candidate
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --volume "${RUNNER_TEMP}/trivy-cache:/root/.cache" \
+            aquasec/trivy:0.56.1@sha256:c42bb3221509b0a9fa2291cd79a3a818b30a172ab87e9aac8a43997a5b56f293 \
+            image --format sarif --output /workspace/trivy-results.sarif \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            "${LOCAL_IMAGE}"
+
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish scanned image to immutable release tags
+        id: publish
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          first_tag=""
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            [[ -z "${first_tag}" ]] && first_tag="${tag}"
+            if docker manifest inspect "${tag}" > /dev/null 2>&1; then
+              echo "Refusing to overwrite existing release tag: ${tag}" >&2
+              exit 1
+            fi
+          done <<< "${RELEASE_TAGS}"
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            docker tag "${LOCAL_IMAGE}" "${tag}"
+            docker push "${tag}"
+          done <<< "${RELEASE_TAGS}"
+          if [[ -z "${first_tag}" ]]; then
+            echo "No release tags were generated." >&2
+            exit 1
+          fi
+          digest="sha256:$(docker buildx imagetools inspect --raw "${first_tag}" | sha256sum | awk '{print $1}')"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true

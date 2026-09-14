@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: 0.9.21
+          enable-cache: true
+
+      - name: Verify lock file
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run --no-sync pytest
+
+      - name: Run Ruff
+        run: uv run --no-sync ruff check .
+
+      - name: Run mypy
+        run: uv run --no-sync mypy src/ai_agent
+
+      - name: Check whitespace errors
+        run: git diff --check $(git hash-object -t tree /dev/null) HEAD
+
+      - name: Parse PowerShell operational scripts
+        shell: bash
+        run: |
+          pwsh -NoLogo -NoProfile -NonInteractive -Command '
+            $errors = @()
+            Get-ChildItem -LiteralPath scripts -Filter *.ps1 -File | ForEach-Object {
+              $tokens = $null
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+              $errors += $parseErrors
+            }
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-Host
+              exit 1
+            }
+          '
+
+      - name: Test backup verification safeguards
+        shell: pwsh
+        run: ./tests/powershell/verify-backup.Tests.ps1
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+
+  container:
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Validate production image build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: enterprise-ai-agent:ci
+          build-args: |
+            VERSION=0.3.0
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.run_started_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -19,14 +19,7 @@ if (-not $ConfirmRestore) {
 
 $resolvedBackup = (Resolve-Path -LiteralPath $BackupFile).Path
 $passwordPath = (Resolve-Path -LiteralPath $DatabasePasswordFile).Path
-$checksumFile = "$resolvedBackup.sha256"
-if (Test-Path -LiteralPath $checksumFile) {
-    $expected = (Get-Content -Raw -LiteralPath $checksumFile).Trim()
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedBackup).Hash
-    if ($expected -ne $actual) {
-        throw "Backup checksum validation failed."
-    }
-}
+& (Join-Path $PSScriptRoot "verify-backup.ps1") -BackupFile $resolvedBackup
 
 $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tempDirectory | Out-Null

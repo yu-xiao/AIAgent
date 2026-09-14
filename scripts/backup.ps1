@@ -41,6 +41,7 @@ try {
     }
     $databaseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $databaseBackup).Hash
     Set-Content -LiteralPath "$databaseBackup.sha256" -Value $databaseHash
+    & (Join-Path $PSScriptRoot "verify-backup.ps1") -BackupFile $databaseBackup
 
     if ($IncludeVaultSnapshot) {
         if (-not $VaultAddress -or -not $VaultTokenFile) {

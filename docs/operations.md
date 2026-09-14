@@ -36,10 +36,37 @@ AI_AGENT_UPSTREAM_CONFIG
 
 ## 蓝绿发布
 
+### CI/CD 与供应链门禁
+
+所有 Pull Request 和推送到 `master` 的提交都必须通过 GitHub Actions：锁文件校验、冻结
+依赖安装、pytest、Ruff、mypy、PowerShell 脚本解析、依赖变更审查和 Docker 镜像构建验证。
+Dependabot 每周分别检查 Python 依赖、GitHub Actions 和 Docker 基础镜像；依赖升级必须经过
+同一套 CI 门禁。Docker 基础镜像固定到 digest，工作流中的顶层第三方 Action 固定到完整
+commit SHA，避免可变 tag 在未经代码审查时改变构建输入。
+
+发布只接受 `vMAJOR.MINOR.PATCH` 版本标签或受控手动发布。发布工作流在 runner 本地只构建
+一次候选镜像，先生成 SPDX JSON SBOM 并执行 Trivy 扫描。只有扫描通过后才登录 GHCR，将
+同一个本地镜像推送为版本 tag 和提交 SHA tag；因此未通过门禁的镜像不会进入镜像仓库，也
+不会因为二次构建而产生与已扫描制品不同的镜像。发布后按实际 registry digest 生成 GitHub
+签名的 build provenance 和 SBOM attestations。Trivy 发现未修复之外的 HIGH/CRITICAL 漏洞
+时发布失败，扫描结果写入 GitHub Code Scanning。发布提交必须可从 `origin/master` 到达；
+工作流会串行执行，并拒绝覆盖已经存在的版本或提交 SHA tag。
+生产准入还应在仓库设置中启用 `master` 分支保护、Required status checks、至少一名代码审查
+者和禁止直接推送；Actions 使用最小权限，GHCR 只允许发布工作流写入。
+
+生产环境禁止使用 `latest`、`next` 或其他可变 tag。部署前将蓝绿镜像变量设置为经过扫描的
+版本 tag，关键环境建议进一步固定 digest，并在变更单中记录镜像 digest、Git commit、SBOM
+和 provenance 链接：
+
+```powershell
+$env:AI_AGENT_IMAGE_BLUE = "ghcr.io/your-org/ai-agent:v0.3.0@sha256:<approved-digest>"
+$env:AI_AGENT_IMAGE_GREEN = "ghcr.io/your-org/ai-agent:v0.3.1@sha256:<approved-digest>"
+```
+
 初次启动蓝环境：
 
 ```powershell
-$env:AI_AGENT_IMAGE_BLUE = "registry.example.com/ai-agent:0.3.0"
+$env:AI_AGENT_IMAGE_BLUE = "registry.example.com/ai-agent:0.3.0@sha256:<approved-digest>"
 $env:AI_AGENT_UPSTREAM_CONFIG = "./nginx/upstream-blue.conf"
 docker compose -f deploy/compose.production.yaml up -d migrate api-blue prometheus alertmanager proxy
 ```
@@ -47,7 +74,7 @@ docker compose -f deploy/compose.production.yaml up -d migrate api-blue promethe
 灰度新版本：
 
 ```powershell
-$env:AI_AGENT_IMAGE_GREEN = "registry.example.com/ai-agent:next"
+$env:AI_AGENT_IMAGE_GREEN = "registry.example.com/ai-agent:0.3.1@sha256:<approved-digest>"
 docker compose -f deploy/compose.production.yaml --profile green up -d api-green
 docker compose -f deploy/compose.production.yaml exec -T proxy wget -qO- http://api-green:8000/health/ready
 $env:AI_AGENT_UPSTREAM_CONFIG = "./nginx/upstream-gray.conf"
@@ -116,6 +143,12 @@ uv run --no-sync ai-agent prune-audit --execute
 .\scripts\backup.ps1 -OutputDirectory E:\Backups\AiAgent -DatabaseHost postgres.example.internal -DatabasePasswordFile C:\secure\db-password
 ```
 
+备份脚本会在生成文件后强制执行 checksum 校验和 `pg_restore --list --exit-on-error` 归档
+验证。备份文件与同名 `.sha256` 必须作为一个完整制品传输到加密、访问受控且具备对象锁定
+或等价不可变策略的备份存储；checksum 文件缺失、格式错误、摘要不匹配或归档不可读时，
+恢复脚本会拒绝继续。定期将备份复制到与主环境隔离的区域或账户，并监控备份新鲜度、大小
+异常、校验失败和存储容量。
+
 若 Vault 使用集成 Raft 存储，可增加 `-IncludeVaultSnapshot`、`-VaultAddress` 和
 `-VaultTokenFile`。托管 Vault 应使用供应商快照流程。Redis 仅保存会话、短期事件、
 Catalog、配额和策略状态，不作为权威业务存储；灾难恢复时不回灌过期 Redis 数据。
@@ -127,7 +160,10 @@ Catalog、配额和策略状态，不作为权威业务存储；灾难恢复时�
 ```
 
 恢复后依次执行 Alembic、`check-config`、只读登录/MCP 冒烟测试和审计核对。恢复演练不得
-直接指向生产主库。RPO/RTO 以季度恢复演练的实测结果为准。
+直接指向生产主库。至少每季度执行一次完整恢复演练，验证 PostgreSQL custom archive、Vault
+快照（如使用 Raft）、密钥重新挂载、Alembic、只读登录、MCP 冒烟和审计完整性；记录从发现
+故障到恢复可用的 RTO、可恢复数据点的 RPO、失败步骤及改进项。RPO/RTO 以季度恢复演练的
+实测结果为准，不能只以备份成功作为灾备验收。
 
 ## 故障演练
 
