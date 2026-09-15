@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 
 from ai_agent.agents.control import AgentControlService
 from ai_agent.audit.service import AuditService
-from ai_agent.config import CredentialVaultBackend, ExecutionMode, Settings
+from ai_agent.config import CredentialVaultBackend, Environment, ExecutionMode, Settings
 from ai_agent.connections.service import ConnectionService
 from ai_agent.conversations.service import ConversationService
 from ai_agent.credentials.vault import (
@@ -21,6 +21,8 @@ from ai_agent.credentials.vault import (
     HashicorpVaultCredentialVault,
     MemoryCredentialVault,
 )
+from ai_agent.evaluations.executor import EvaluationExecutor
+from ai_agent.evaluations.service import EvaluationService
 from ai_agent.governance.quota import RedisRunQuota
 from ai_agent.identity.oidc import OidcLoginService
 from ai_agent.identity.service import IdentityService
@@ -68,6 +70,8 @@ class AppServices:
     gateway: McpGateway | None = None
     permission_system: PermissionSystemService | None = None
     agent_control: AgentControlService | None = None
+    evaluations: EvaluationService | None = None
+    evaluation_executor: EvaluationExecutor | None = None
 
     async def ping(self) -> None:
         await self.database.ping()
@@ -78,6 +82,18 @@ class AppServices:
     async def start(self, settings: Settings) -> None:
         if self.connections is not None:
             await self.connections.retry_pending_revocations()
+        if self.evaluations is not None and self.evaluation_executor is not None:
+            for evaluation_run in await self.evaluations.recover_incomplete_runs():
+                try:
+                    self.evaluation_executor.submit(evaluation_run.id)
+                except Exception:
+                    logger.exception(
+                        "Failed to recover evaluation run",
+                        extra={"evaluation_run_id": str(evaluation_run.id)},
+                    )
+                    await self.evaluations.fail_run(
+                        evaluation_run.id, "evaluation_recovery_submission_failed"
+                    )
         if settings.execution.mode == ExecutionMode.EXTERNAL_WORKER:
             return
         queued = await self.conversations.recover_incomplete_runs(
@@ -101,6 +117,8 @@ class AppServices:
                 )
 
     async def close(self) -> None:
+        if self.evaluation_executor is not None:
+            await self.evaluation_executor.close()
         await self.executor.close()
         if self.vault is not None:
             await self.vault.close()
@@ -124,6 +142,13 @@ def build_services(settings: Settings) -> AppServices:
         key_id=settings.governance.audit_integrity_key_id,
     )
     identities = IdentityService(database.session_factory, audit)
+    evaluations = EvaluationService(
+        database.session_factory,
+        identities,
+        environment=settings.environment,
+        max_cases_per_dataset=settings.evaluation.max_cases_per_dataset,
+        audit=audit,
+    )
     agent_control = AgentControlService(
         database.session_factory,
         identities,
@@ -131,6 +156,8 @@ def build_services(settings: Settings) -> AppServices:
         settings.model.system_prompt,
         mode=settings.agent_control.mode,
         environment=settings.environment,
+        evaluation_gate_mode=settings.evaluation.gate_mode,
+        evaluations=evaluations,
         audit=audit,
     )
     conversations = ConversationService(
@@ -194,6 +221,27 @@ def build_services(settings: Settings) -> AppServices:
         gateway,
         expected_tools=settings.permission_system.expected_tools,
     )
+    evaluation_executor = (
+        EvaluationExecutor(
+            evaluations,
+            agent_control,
+            provider,
+            settings.model,
+            gateway=gateway if settings.mcp_gateway.enabled else None,
+            tool_system_code=(
+                "permission-system" if settings.permission_system.enabled else None
+            ),
+            tool_allowlist=(
+                frozenset(settings.permission_system.expected_tools)
+                if settings.permission_system.enabled
+                else None
+            ),
+            personal_tools_only=settings.permission_system.enabled,
+            max_concurrent_runs=settings.evaluation.max_concurrent_runs,
+        )
+        if settings.environment == Environment.DEVELOPMENT
+        else None
+    )
     quota = (
         RedisRunQuota(
             redis,
@@ -249,6 +297,8 @@ def build_services(settings: Settings) -> AppServices:
         gateway=gateway,
         permission_system=permission_system,
         agent_control=agent_control,
+        evaluations=evaluations,
+        evaluation_executor=evaluation_executor,
     )
 
 

@@ -27,6 +27,10 @@ AGENT_DRAFT_WRITE = "agent:draft:write"
 AGENT_VERSION_CREATE = "agent:version:create"
 AGENT_RELEASE = "agent:release"
 AGENT_RELEASE_BYPASS = "agent:release:bypass"
+EVAL_VIEW = "eval:view"
+EVAL_DATASET_WRITE = "eval:dataset:write"
+EVAL_RUN_CREATE = "eval:run:create"
+EVAL_POLICY_MANAGE = "eval:policy:manage"
 AUDIT_VIEW = "audit:view"
 ORGANIZATION_MEMBER_MANAGE = "organization:member:manage"
 CONNECTION_PERSONAL_CREATE = "connection:personal:create"
@@ -57,6 +61,10 @@ PERMISSION_DEFINITIONS = {
     AGENT_VERSION_CREATE: "Create immutable Agent versions.",
     AGENT_RELEASE: "Release and roll back evaluated Agent versions.",
     AGENT_RELEASE_BYPASS: "Bypass an Agent release gate with an audited reason.",
+    EVAL_VIEW: "View evaluation datasets, policies, and results.",
+    EVAL_DATASET_WRITE: "Create and version evaluation datasets.",
+    EVAL_RUN_CREATE: "Run evaluations for immutable Agent versions.",
+    EVAL_POLICY_MANAGE: "Manage Agent evaluation gate policies.",
     AUDIT_VIEW: "View organization audit records.",
     ORGANIZATION_MEMBER_MANAGE: "Manage organization members and roles.",
     CONNECTION_PERSONAL_CREATE: "Create personal external connections.",

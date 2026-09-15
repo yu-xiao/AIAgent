@@ -7,7 +7,7 @@ import hmac
 import json
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -16,7 +16,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_agent.audit.service import AuditService
-from ai_agent.config import AgentControlMode, Environment, RunLimitSettings
+from ai_agent.config import (
+    AgentControlMode,
+    Environment,
+    EvaluationGateMode,
+    RunLimitSettings,
+)
 from ai_agent.errors import ConfigurationError, ConflictError, ResourceNotFoundError
 from ai_agent.identity.service import (
     AGENT_DRAFT_WRITE,
@@ -36,6 +41,9 @@ from ai_agent.persistence.models import (
     AgentStatus,
     AgentVersion,
 )
+
+if TYPE_CHECKING:
+    from ai_agent.evaluations.service import EvaluationService
 
 _AGENT_CODE = re.compile(r"^[a-z][a-z0-9-]{1,99}$")
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
@@ -89,6 +97,8 @@ class AgentControlService:
         *,
         mode: AgentControlMode = AgentControlMode.LEGACY,
         environment: Environment = Environment.DEVELOPMENT,
+        evaluation_gate_mode: EvaluationGateMode = EvaluationGateMode.OFF,
+        evaluations: EvaluationService | None = None,
         audit: AuditService | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -96,6 +106,8 @@ class AgentControlService:
         self._platform_limits = platform_limits
         self._mode = mode
         self._environment = environment
+        self._evaluation_gate_mode = evaluation_gate_mode
+        self._evaluations = evaluations
         self._audit = audit or AuditService()
         self._default_config = AgentVersionConfig(
             system_prompt=default_system_prompt,
@@ -362,12 +374,21 @@ class AgentControlService:
         idempotency_key: str | None,
         expected_generation: int | None,
         bypass_gate: bool,
+        evaluation_run_id: UUID | None = None,
     ) -> tuple[AgentRelease, AgentDeployment]:
         await self._identities.access(actor_id, organization_id, AGENT_RELEASE)
         if bypass_gate:
             await self._identities.access(actor_id, organization_id, AGENT_RELEASE_BYPASS)
         if self._environment == Environment.PRODUCTION and not bypass_gate:
             raise ConflictError("Production release requires an evaluation gate or audited bypass.")
+        if bypass_gate and evaluation_run_id is not None:
+            raise ConflictError("A bypassed release must not attach an evaluation run.")
+        if (
+            self._environment != Environment.PRODUCTION
+            and self._evaluation_gate_mode == EvaluationGateMode.OFF
+            and evaluation_run_id is not None
+        ):
+            raise ConflictError("Evaluation release evidence is disabled.")
         normalized_reason = reason.strip()
         if not normalized_reason:
             raise ConflictError("Agent release reason must not be blank.")
@@ -382,6 +403,7 @@ class AgentControlService:
                         action,
                         normalized_reason,
                         bypass_gate,
+                        evaluation_run_id,
                         idempotency_key,
                     )
                     if existing is not None:
@@ -398,6 +420,7 @@ class AgentControlService:
                         action,
                         normalized_reason,
                         bypass_gate,
+                        evaluation_run_id,
                         idempotency_key,
                     )
                     if existing is not None:
@@ -411,6 +434,40 @@ class AgentControlService:
                 )
                 if version is None:
                     raise ResourceNotFoundError("Agent version not found.")
+                bound_evaluation_run_id: UUID | None = None
+                gate_decision = "bypassed" if bypass_gate else "not_required"
+                gate_policy_digest: str | None = None
+                if (
+                    not bypass_gate
+                    and self._environment != Environment.PRODUCTION
+                    and self._evaluation_gate_mode != EvaluationGateMode.OFF
+                ):
+                    if self._evaluations is None:
+                        if self._evaluation_gate_mode == EvaluationGateMode.REQUIRED:
+                            raise ConflictError("Evaluation release gate is unavailable.")
+                        gate_decision = "unavailable"
+                    else:
+                        assessment = await self._evaluations.assess_release(
+                            session,
+                            organization_id,
+                            agent_id,
+                            version_id,
+                            evaluation_run_id,
+                        )
+                        if evaluation_run_id is not None and assessment.evaluation_run_id is None:
+                            raise ConflictError(
+                                "Evaluation run does not match this Agent release."
+                            )
+                        if (
+                            self._evaluation_gate_mode == EvaluationGateMode.REQUIRED
+                            and not assessment.passed
+                        ):
+                            raise ConflictError(
+                                "Agent version has not passed the current evaluation gate."
+                            )
+                        bound_evaluation_run_id = assessment.evaluation_run_id
+                        gate_decision = assessment.decision
+                        gate_policy_digest = assessment.policy_digest
                 if action == AgentReleaseAction.ROLLBACK:
                     previously_deployed = await session.scalar(
                         select(AgentRelease.id).where(
@@ -458,6 +515,9 @@ class AgentControlService:
                     status=AgentReleaseStatus.DEPLOYED,
                     reason=normalized_reason,
                     bypassed_gate=bypass_gate,
+                    evaluation_run_id=bound_evaluation_run_id,
+                    gate_decision=gate_decision,
+                    gate_policy_digest=gate_policy_digest,
                     idempotency_key=idempotency_key,
                     requested_by=actor_id,
                 )
@@ -478,6 +538,13 @@ class AgentControlService:
                             ),
                             "generation": deployment.generation,
                             "bypassed_gate": bypass_gate,
+                            "evaluation_run_id": (
+                                str(bound_evaluation_run_id)
+                                if bound_evaluation_run_id is not None
+                                else None
+                            ),
+                            "gate_decision": gate_decision,
+                            "gate_policy_digest": gate_policy_digest,
                             "reason": normalized_reason,
                         },
                     )
@@ -496,6 +563,7 @@ class AgentControlService:
                         action,
                         normalized_reason,
                         bypass_gate,
+                        evaluation_run_id,
                         idempotency_key,
                     )
                     if existing is not None:
@@ -631,6 +699,7 @@ class AgentControlService:
         action: AgentReleaseAction,
         reason: str,
         bypass_gate: bool,
+        evaluation_run_id: UUID | None,
         idempotency_key: str,
     ) -> tuple[AgentRelease, AgentDeployment] | None:
         existing = await session.scalar(
@@ -648,6 +717,7 @@ class AgentControlService:
             or existing.action != action
             or existing.reason != reason
             or existing.bypassed_gate != bypass_gate
+            or existing.evaluation_run_id != evaluation_run_id
         ):
             raise ConflictError("Idempotency key was used for another release.")
         deployment = await self._deployment(session, organization_id, agent_id)

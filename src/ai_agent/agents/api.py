@@ -80,6 +80,7 @@ class ReleaseCreate(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
     expected_generation: int | None = Field(default=None, ge=0)
     bypass_gate: bool = False
+    evaluation_run_id: UUID | None = None
 
 
 class DeploymentView(BaseModel):
@@ -100,6 +101,9 @@ class ReleaseView(BaseModel):
     status: str
     reason: str
     bypassed_gate: bool
+    evaluation_run_id: UUID | None
+    gate_decision: str | None
+    gate_policy_digest: str | None
     created_at: datetime
 
 
@@ -307,6 +311,7 @@ async def _release(
         idempotency_key=idempotency_key,
         expected_generation=payload.expected_generation,
         bypass_gate=payload.bypass_gate,
+        evaluation_run_id=payload.evaluation_run_id,
     )
     return ReleaseResult(
         release=_release_view(release),
@@ -385,6 +390,9 @@ def _release_view(release: AgentRelease) -> ReleaseView:
         status=release.status.value,
         reason=release.reason,
         bypassed_gate=release.bypassed_gate,
+        evaluation_run_id=release.evaluation_run_id,
+        gate_decision=release.gate_decision,
+        gate_policy_digest=release.gate_policy_digest,
         created_at=release.created_at,
     )
 

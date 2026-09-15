@@ -71,6 +71,19 @@ class AgentReleaseStatus(StrEnum):
     DEPLOYED = "deployed"
 
 
+class EvaluationDatasetStatus(StrEnum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class EvaluationRunStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class McpTransport(StrEnum):
     STREAMABLE_HTTP = "streamable_http"
 
@@ -367,10 +380,206 @@ class AgentRelease(Base):
     )
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
     bypassed_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    evaluation_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="RESTRICT")
+    )
+    gate_decision: Mapped[str | None] = mapped_column(String(30))
+    gate_policy_digest: Mapped[str | None] = mapped_column(String(64))
     idempotency_key: Mapped[str | None] = mapped_column(String(200))
     requested_by: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class EvaluationDataset(TimestampMixin, Base):
+    __tablename__ = "evaluation_datasets"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_eval_datasets_org_code"),
+        Index("ix_eval_datasets_org_status", "organization_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(String(1_000), nullable=False, default="")
+    status: Mapped[EvaluationDatasetStatus] = mapped_column(
+        Enum(
+            EvaluationDatasetStatus,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=EvaluationDatasetStatus.ACTIVE,
+    )
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class EvaluationDatasetDraft(TimestampMixin, Base):
+    __tablename__ = "evaluation_dataset_drafts"
+
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_datasets.id", ondelete="CASCADE"), primary_key=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    cases: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    updated_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class EvaluationDatasetVersion(Base):
+    __tablename__ = "evaluation_dataset_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id", "version_number", name="uq_eval_dataset_versions_number"
+        ),
+        Index(
+            "ix_eval_dataset_versions_org_dataset",
+            "organization_id",
+            "dataset_id",
+            "version_number",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_datasets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    cases_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    cases_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class AgentEvaluationPolicy(TimestampMixin, Base):
+    __tablename__ = "agent_evaluation_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "environment", name="uq_agent_eval_policies_environment"
+        ),
+        Index("ix_agent_eval_policies_org_environment", "organization_id", "environment"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(30), nullable=False)
+    dataset_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_dataset_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    min_pass_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    max_critical_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    policy_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class EvaluationRun(TimestampMixin, Base):
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "idempotency_key", name="uq_eval_runs_org_idempotency"
+        ),
+        Index("ix_eval_runs_org_agent_created", "organization_id", "agent_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    agent_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    agent_config_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_dataset_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    policy_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_evaluation_policies.id", ondelete="RESTRICT"), nullable=False
+    )
+    policy_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    min_pass_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    max_critical_failures: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    trace_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, unique=True, default=uuid4)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[EvaluationRunStatus] = mapped_column(
+        Enum(
+            EvaluationRunStatus,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=EvaluationRunStatus.QUEUED,
+    )
+    total_cases: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    passed_cases: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    critical_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pass_rate: Mapped[float | None] = mapped_column(Float)
+    gate_passed: Mapped[bool | None] = mapped_column(Boolean)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EvaluationCaseResult(Base):
+    __tablename__ = "evaluation_case_results"
+    __table_args__ = (
+        UniqueConstraint("evaluation_run_id", "case_key", name="uq_eval_results_run_case"),
+        Index("ix_eval_results_org_run", "organization_id", "evaluation_run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    evaluation_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    case_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    used_tools: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    citations_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    answer_digest: Mapped[str | None] = mapped_column(String(64))
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

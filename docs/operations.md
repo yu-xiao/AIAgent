@@ -134,6 +134,33 @@ Agent 数据迁移、灰度和评测门禁后，才能将生产切换到 `manage
 Run 仍引用原版本。任何数据库恢复或手工排障都不得修改 `agent_versions.config_snapshot` 或
 `config_digest`。
 
+## 开发环境 EvalOps 门禁
+
+开发环境可使用 `AI_AGENT_EVALUATION__GATE_MODE=advisory` 先观察评测结果，不阻断发布；数据集
+和阈值稳定后切换为 `required`。`off` 完全关闭门禁证据处理。生产示例保持 `off`，且生产发布
+仍沿用无门禁默认拒绝、仅允许审计绕过的 3A 行为。
+
+评测数据集先编辑 Draft，再生成不可变 Dataset Version。Agent Evaluation Policy 绑定具体
+Dataset Version，并显式设置 `min_pass_rate` 和 `max_critical_failures`；平台不会猜测业务质量
+阈值。Policy 每次修改都会改变摘要，旧 Evaluation Run 不能用于强制发布。
+
+开发环境 Evaluation Run 在 API 进程内受并发限制执行，状态和单用例结果持久化。服务重启时
+排队任务会重新提交，已中断任务标记失败。结果只保存答案 SHA-256、Tool 名称、Citation 数量、
+Token 和耗时，不保存模型原始回答或 Tool 业务返回。生产规模化前需实现独立 Eval Worker。
+
+主要接口：
+
+- `POST/GET /api/v1/evaluations/datasets`
+- `GET/PUT /api/v1/evaluations/datasets/{id}/draft`
+- `POST/GET /api/v1/evaluations/datasets/{id}/versions`
+- `GET/PUT /api/v1/agents/{id}/evaluation-policy`
+- `POST /api/v1/agents/{id}/evaluations`
+- `GET /api/v1/evaluations/runs/{id}`
+- `POST /api/v1/evaluations/runs/{id}/cancel`
+
+发布时在请求体传入已通过的 `evaluation_run_id`。`required` 模式拒绝缺失、失败、未完成、版本
+不匹配或 Policy 摘要过期的评测；`advisory` 模式记录对应 Gate Decision 后允许继续。
+
 ## 凭证轮换
 
 - Vault Token 通过文件读取，每次 Vault 请求都会重新加载；原子替换 Token 文件后无需

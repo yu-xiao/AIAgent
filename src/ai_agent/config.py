@@ -41,6 +41,12 @@ class AgentControlMode(StrEnum):
     MANAGED_REQUIRED = "managed_required"
 
 
+class EvaluationGateMode(StrEnum):
+    OFF = "off"
+    ADVISORY = "advisory"
+    REQUIRED = "required"
+
+
 class OidcSettings(BaseModel):
     enabled: bool = False
     issuer: str = "http://localhost:8081/realms/ai-agent"
@@ -237,6 +243,12 @@ class AgentControlSettings(BaseModel):
     mode: AgentControlMode = AgentControlMode.LEGACY
 
 
+class EvaluationSettings(BaseModel):
+    gate_mode: EvaluationGateMode = EvaluationGateMode.ADVISORY
+    max_concurrent_runs: int = Field(default=2, ge=1, le=20)
+    max_cases_per_dataset: int = Field(default=200, ge=1, le=1_000)
+
+
 class ObservabilitySettings(BaseModel):
     tracing_enabled: bool = False
     service_name: str = "enterprise-ai-agent"
@@ -307,6 +319,7 @@ class Settings(BaseSettings):
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     agent_control: AgentControlSettings = Field(default_factory=AgentControlSettings)
+    evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
 

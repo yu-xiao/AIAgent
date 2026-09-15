@@ -35,6 +35,7 @@ from ai_agent.errors import (
     ResourceNotFoundError,
     RunLimitError,
 )
+from ai_agent.evaluations.api import router as evaluation_router
 from ai_agent.identity.api import router as identity_router
 from ai_agent.mcp.api import router as mcp_router
 from ai_agent.observability.metrics import HTTP_DURATION, HTTP_IN_PROGRESS, HTTP_REQUESTS
@@ -134,6 +135,7 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     app.state.services = services
     app.include_router(identity_router)
     app.include_router(agent_router)
+    app.include_router(evaluation_router)
     app.include_router(conversation_router)
     app.include_router(connection_router)
     app.include_router(mcp_router)
@@ -316,6 +318,7 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
                 "run_cancellation": True,
                 "managed_agent_versions": True,
                 "agent_control_mode": runtime_settings.agent_control.mode.value,
+                "evaluation_gate_mode": runtime_settings.evaluation.gate_mode.value,
                 "audit": True,
                 "hard_limits": True,
             },

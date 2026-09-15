@@ -14,6 +14,8 @@ from ai_agent.api import create_app
 from ai_agent.audit.service import AuditService
 from ai_agent.config import ModelSettings, OidcSettings, PlatformSettings, Settings
 from ai_agent.conversations.service import ConversationService
+from ai_agent.evaluations.executor import EvaluationExecutor
+from ai_agent.evaluations.service import EvaluationService
 from ai_agent.identity.oidc import OidcLoginService
 from ai_agent.identity.service import IdentityService
 from ai_agent.identity.sessions import MemorySessionStore
@@ -102,6 +104,13 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
     sessions = MemorySessionStore()
     audit = AuditService(b"test-audit-key", key_id="test-v1")
     identities = IdentityService(database.session_factory, audit)
+    evaluations = EvaluationService(
+        database.session_factory,
+        identities,
+        environment=settings.environment,
+        max_cases_per_dataset=settings.evaluation.max_cases_per_dataset,
+        audit=audit,
+    )
     agent_control = AgentControlService(
         database.session_factory,
         identities,
@@ -109,6 +118,8 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
         settings.model.system_prompt,
         mode=settings.agent_control.mode,
         environment=settings.environment,
+        evaluation_gate_mode=settings.evaluation.gate_mode,
+        evaluations=evaluations,
         audit=audit,
     )
     conversations = ConversationService(
@@ -120,6 +131,13 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
     )
     backend = MemoryRunBackend()
     provider = FakeModelProvider()
+    evaluation_executor = EvaluationExecutor(
+        evaluations,
+        agent_control,
+        provider,
+        settings.model,
+        max_concurrent_runs=settings.evaluation.max_concurrent_runs,
+    )
     oidc = OidcLoginService(settings.oidc, settings.platform, sessions, identities)
     executor = RunExecutor(
         conversations,
@@ -142,6 +160,8 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
         provider=provider,
         audit=audit,
         agent_control=agent_control,
+        evaluations=evaluations,
+        evaluation_executor=evaluation_executor,
     )
     user = await identities.upsert_oidc_user(
         issuer=settings.oidc.issuer,
