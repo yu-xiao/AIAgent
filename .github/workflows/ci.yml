@@ -16,6 +16,22 @@ concurrency:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: ai_agent_test
+          POSTGRES_USER: ai_agent_test
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_agent_test -d ai_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AI_AGENT_TEST_POSTGRES_URL: postgresql+asyncpg://ai_agent_test:test-only-password@127.0.0.1:5432/ai_agent_test
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -40,6 +56,36 @@ jobs:
 
       - name: Run mypy
         run: uv run --no-sync mypy src/ai_agent
+
+      - name: Verify database migrations
+        env:
+          AI_AGENT_PLATFORM__DATABASE_URL: sqlite+aiosqlite:////tmp/ai-agent-migrations.db
+        run: uv run --no-sync alembic upgrade head
+
+      - name: Validate production Compose
+        env:
+          AI_AGENT_IMAGE_BLUE: enterprise-ai-agent:ci
+          AI_AGENT_WORKER_IMAGE: enterprise-ai-agent:ci
+          AI_AGENT_DATABASE_PASSWORD_FILE: /tmp/database-password
+          AI_AGENT_REDIS_PASSWORD_FILE: /tmp/redis-password
+          AI_AGENT_MODEL_API_KEY_FILE: /tmp/model-api-key
+          AI_AGENT_VAULT_TOKEN_FILE: /tmp/vault-token
+          AI_AGENT_AUDIT_INTEGRITY_KEY_FILE: /tmp/audit-key
+          AI_AGENT_TLS_CERTIFICATE_FILE: /tmp/tls-certificate
+          AI_AGENT_TLS_PRIVATE_KEY_FILE: /tmp/tls-private-key
+        run: |
+          for file in \
+            /tmp/database-password \
+            /tmp/redis-password \
+            /tmp/model-api-key \
+            /tmp/vault-token \
+            /tmp/audit-key \
+            /tmp/tls-certificate \
+            /tmp/tls-private-key; do
+            printf 'ci-placeholder' > "$file"
+            chmod 600 "$file"
+          done
+          docker compose -f deploy/compose.production.yaml config --quiet
 
       - name: Check whitespace errors
         run: git diff --check $(git hash-object -t tree /dev/null) HEAD

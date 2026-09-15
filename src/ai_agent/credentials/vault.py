@@ -28,10 +28,24 @@ class Credential(BaseModel):
     client_secret: SecretStr | None = None
     token_type: str = "Bearer"
     expires_at: datetime | None = None
+    client_id: str | None = None
+    token_url: str | None = None
+    scope: str = ""
+    token_endpoint_auth_method: str | None = None
 
     def is_expired(self, skew_seconds: float = 30.0) -> bool:
         return self.expires_at is not None and self.expires_at <= datetime.now(UTC) + timedelta(
             seconds=skew_seconds
+        )
+
+    @property
+    def can_refresh_client_credentials(self) -> bool:
+        return bool(
+            self.client_id
+            and self.client_secret is not None
+            and self.client_secret.get_secret_value()
+            and self.token_url
+            and self.token_endpoint_auth_method
         )
 
 
@@ -41,6 +55,8 @@ class CredentialVault(Protocol):
     async def put(self, credential: Credential, *, ttl_seconds: int | None = None) -> str: ...
 
     async def get(self, reference: str) -> Credential | None: ...
+
+    async def replace(self, reference: str, credential: Credential) -> None: ...
 
     async def revoke(self, reference: str) -> None: ...
 
@@ -73,6 +89,14 @@ class MemoryCredentialVault:
         async with self._lock:
             credential = self._values.get(reference)
             return credential.model_copy(deep=True) if credential else None
+
+    async def replace(self, reference: str, credential: Credential) -> None:
+        if not credential.access_token.get_secret_value():
+            raise ConfigurationError("Credential access token must not be empty.")
+        async with self._lock:
+            if reference not in self._values:
+                raise AuthenticationError("Credential reference is missing.")
+            self._values[reference] = credential.model_copy(deep=True)
 
     async def revoke(self, reference: str) -> None:
         async with self._lock:
@@ -129,9 +153,18 @@ class HashicorpVaultCredentialVault:
             raise AuthenticationError("Vault returned an invalid credential payload.") from exc
         if credential.is_expired(skew_seconds=0):
             VAULT_OPERATIONS.labels(operation="read", status="expired").inc()
-            return None
-        VAULT_OPERATIONS.labels(operation="read", status="succeeded").inc()
+        else:
+            VAULT_OPERATIONS.labels(operation="read", status="succeeded").inc()
         return credential
+
+    async def replace(self, reference: str, credential: Credential) -> None:
+        self._validate_reference(reference)
+        try:
+            await self._write(reference, credential, ttl_seconds=None)
+        except Exception:
+            VAULT_OPERATIONS.labels(operation="replace", status="failed").inc()
+            raise
+        VAULT_OPERATIONS.labels(operation="replace", status="succeeded").inc()
 
     async def revoke(self, reference: str) -> None:
         self._validate_reference(reference)

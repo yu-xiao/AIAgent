@@ -23,6 +23,7 @@ from ai_agent.errors import (
     RateLimitExceededError,
 )
 from ai_agent.mcp.models import Citation, RunContext, ToolDefinition, ToolResult
+from ai_agent.mcp.schema import validate_instance
 from ai_agent.mcp.tool_catalog import ResolvedTool, ToolCatalogService
 from ai_agent.observability.metrics import AUDIT_WRITE_FAILURES, MCP_CALLS, MCP_DURATION
 from ai_agent.observability.tracing import operation_span
@@ -258,7 +259,7 @@ class McpGateway:
             raise McpConnectionError("MCP Tool call failed.") from exc
 
     def _validate_input(self, definition: ToolDefinition, arguments: dict[str, Any]) -> None:
-        _validate_json_schema(arguments, definition.input_schema, path="$")
+        validate_instance(arguments, definition.input_schema, label="MCP Tool input")
 
     def _result(
         self,
@@ -273,7 +274,7 @@ class McpGateway:
         content = [_to_json(item) for item in raw.content]
         payload = structured if structured is not None else content
         if resolved.definition.output_schema:
-            _validate_json_schema(payload, resolved.definition.output_schema, path="$")
+            validate_instance(payload, resolved.definition.output_schema, label="MCP Tool output")
         encoded = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
         truncated = len(encoded.encode("utf-8")) > resolved.server.response_size_limit
         if truncated:
@@ -338,47 +339,6 @@ class McpGateway:
     def _observe(resolved: ResolvedTool, status: str, started: float) -> None:
         MCP_CALLS.labels(server=resolved.server.code, status=status).inc()
         MCP_DURATION.labels(server=resolved.server.code).observe(time.monotonic() - started)
-
-
-def _validate_json_schema(value: Any, schema: dict[str, Any], *, path: str) -> None:
-    if not schema:
-        return
-    expected = schema.get("type")
-    if expected == "object":
-        if not isinstance(value, dict):
-            raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-        for required in schema.get("required", []):
-            if required not in value:
-                raise ProtocolValidationError(
-                    f"Tool schema validation failed at {path}.{required}."
-                )
-        properties = schema.get("properties", {})
-        if schema.get("additionalProperties") is False:
-            unknown = set(value) - set(properties)
-            if unknown:
-                raise ProtocolValidationError(f"Tool schema rejected unknown fields at {path}.")
-        for name, child in properties.items():
-            if name in value and isinstance(child, dict):
-                _validate_json_schema(value[name], child, path=f"{path}.{name}")
-    elif expected == "array":
-        if not isinstance(value, list):
-            raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-        item_schema = schema.get("items")
-        if isinstance(item_schema, dict):
-            for index, item in enumerate(value):
-                _validate_json_schema(item, item_schema, path=f"{path}[{index}]")
-    elif expected == "string" and not isinstance(value, str):
-        raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-    elif expected == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-        raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-    elif expected == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
-        raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-    elif expected == "boolean" and not isinstance(value, bool):
-        raise ProtocolValidationError(f"Tool schema validation failed at {path}.")
-    if "enum" in schema and value not in schema["enum"]:
-        raise ProtocolValidationError(f"Tool schema enum validation failed at {path}.")
-    if isinstance(value, str) and "maxLength" in schema and len(value) > schema["maxLength"]:
-        raise ProtocolValidationError(f"Tool schema length validation failed at {path}.")
 
 
 def _to_json(value: Any) -> Any:

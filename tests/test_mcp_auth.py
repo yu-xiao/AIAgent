@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+from datetime import UTC, datetime, timedelta
 
 import respx
 from httpx import Request, Response
 from pydantic import SecretStr
 
 from ai_agent.config import TokenEndpointAuthMethod
-from ai_agent.mcp.auth import ClientCredentialsTokenProvider
+from ai_agent.credentials.vault import Credential, MemoryCredentialVault
+from ai_agent.mcp.auth import ClientCredentialsTokenProvider, VaultAccessTokenProvider
 
 
 @respx.mock
@@ -38,3 +41,34 @@ async def test_client_credentials_token_is_authenticated_and_cached() -> None:
     assert first.get_secret_value() == "short-lived"
     assert second.get_secret_value() == "short-lived"
     assert route.call_count == 1
+
+
+@respx.mock
+async def test_expired_vault_client_credentials_are_refreshed_once() -> None:
+    vault = MemoryCredentialVault()
+    reference = await vault.put(
+        Credential(
+            access_token=SecretStr("expired"),
+            client_id="service-client",
+            client_secret=SecretStr("service-secret"),
+            token_url="https://id.example.test/token",
+            scope="business.read",
+            token_endpoint_auth_method=TokenEndpointAuthMethod.CLIENT_SECRET_BASIC.value,
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+    )
+    route = respx.post("https://id.example.test/token").mock(
+        return_value=Response(
+            200,
+            json={"access_token": "renewed", "token_type": "Bearer", "expires_in": 600},
+        )
+    )
+    providers = [VaultAccessTokenProvider(vault, reference) for _ in range(3)]
+
+    tokens = await asyncio.gather(*(provider.get_access_token() for provider in providers))
+
+    assert [token.get_secret_value() for token in tokens] == ["renewed"] * 3
+    assert route.call_count == 1
+    stored = await vault.get(reference)
+    assert stored is not None
+    assert stored.access_token.get_secret_value() == "renewed"

@@ -4,7 +4,7 @@
 
 1. 将 `.env.production.example` 复制为不入库的 `.env.production`，替换所有示例域名、
    模型、价格和容量值。
-2. 准备数据库密码、Redis 密码、模型 API Key、Vault Token、TLS 证书和私钥文件。
+2. 准备数据库密码、Redis 密码、模型 API Key、Vault Token、审计完整性密钥、TLS 证书和私钥文件。
 3. 确认 PostgreSQL TLS、备份/PITR，Redis TLS、持久化策略，以及 Vault HA/审计设备已
    由对应基础设施负责人验收。
 4. 确认网络只允许 API 访问已登记的 OIDC、模型、Vault、PostgreSQL、Redis 和
@@ -27,10 +27,12 @@ AI_AGENT_DATABASE_PASSWORD_FILE
 AI_AGENT_REDIS_PASSWORD_FILE
 AI_AGENT_MODEL_API_KEY_FILE
 AI_AGENT_VAULT_TOKEN_FILE
+AI_AGENT_AUDIT_INTEGRITY_KEY_FILE
 AI_AGENT_TLS_CERTIFICATE_FILE
 AI_AGENT_TLS_PRIVATE_KEY_FILE
 AI_AGENT_IMAGE_BLUE
 AI_AGENT_IMAGE_GREEN
+AI_AGENT_WORKER_IMAGE
 AI_AGENT_UPSTREAM_CONFIG
 ```
 
@@ -61,6 +63,7 @@ commit SHA，避免可变 tag 在未经代码审查时改变构建输入。
 ```powershell
 $env:AI_AGENT_IMAGE_BLUE = "ghcr.io/your-org/ai-agent:v0.3.0@sha256:<approved-digest>"
 $env:AI_AGENT_IMAGE_GREEN = "ghcr.io/your-org/ai-agent:v0.3.1@sha256:<approved-digest>"
+$env:AI_AGENT_WORKER_IMAGE = $env:AI_AGENT_IMAGE_BLUE
 ```
 
 初次启动蓝环境：
@@ -68,7 +71,7 @@ $env:AI_AGENT_IMAGE_GREEN = "ghcr.io/your-org/ai-agent:v0.3.1@sha256:<approved-d
 ```powershell
 $env:AI_AGENT_IMAGE_BLUE = "registry.example.com/ai-agent:0.3.0@sha256:<approved-digest>"
 $env:AI_AGENT_UPSTREAM_CONFIG = "./nginx/upstream-blue.conf"
-docker compose -f deploy/compose.production.yaml up -d migrate api-blue prometheus alertmanager proxy
+docker compose -f deploy/compose.production.yaml up -d migrate worker api-blue prometheus alertmanager proxy
 ```
 
 灰度新版本：
@@ -103,9 +106,19 @@ uv run --no-sync ai-agent runs status
 uv run --no-sync ai-agent runs enable
 ```
 
-容器收到停止信号后先停止接收新 Run，并等待最多 30 秒；仍未结束的任务被取消并记录
-`service_shutdown`。启动时，超过 300 秒的 `running` Run 标记为中断失败，数据库中的
-`queued` Run 会重新提交。不要通过直接修改数据库状态代替上述机制。
+生产 API 只在 Redis 中存在有效 Worker 心跳时接收新 Run。API 将 Run 和 `run_jobs` 在同一
+数据库事务中持久化，独立 Worker 使用租约领取；API 重启不会丢失已排队任务。Worker 收到
+停止信号后停止领取并等待在途任务排空；租约在执行前失效时任务可重新排队，执行开始后租约
+失效则失败关闭并进入死信状态，避免自动重放可能有副作用的 Tool。Run 终态、Job 终态和
+Attempt 结果由租约令牌保护并在同一数据库事务提交。执行前失败按
+`AI_AGENT_EXECUTION__RETRY_DELAY_SECONDS` 指数退避，在
+`AI_AGENT_EXECUTION__RETRY_MAX_DELAY_SECONDS` 封顶，并通过
+`AI_AGENT_EXECUTION__RETRY_JITTER_RATIO` 抖动减少 Worker 同时重试。不要通过直接修改数据库
+状态代替上述机制。
+
+升级 Worker 时先关闭新 Run，排空旧 Worker，再将 `AI_AGENT_WORKER_IMAGE` 切换到与目标 API
+相同的已批准镜像 Digest，启动并确认 `ai-agent worker-health` 成功后重新开放 Run。数据库
+迁移保留，回滚应用时不得删除 `run_jobs` 或 `run_job_attempts`。
 
 ## 凭证轮换
 

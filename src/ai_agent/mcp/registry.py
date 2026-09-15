@@ -5,7 +5,7 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -72,6 +72,21 @@ class McpServerSpec(BaseModel):
             _validate_http_url(value)
         return value
 
+    @field_validator("allowed_tools")
+    @classmethod
+    def validate_allowed_tools(cls, value: list[str]) -> list[str]:
+        return _normalize_tool_names(value, "MCP Server allowed tools", allow_empty=True)
+
+    @field_validator("tool_sets")
+    @classmethod
+    def validate_tool_sets(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        return _normalize_tool_sets(value)
+
+    @model_validator(mode="after")
+    def validate_tool_policy(self) -> McpServerSpec:
+        _validate_tool_set_membership(self.allowed_tools, self.tool_sets)
+        return self
+
 
 class McpServerUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -121,6 +136,20 @@ class McpServerUpdate(BaseModel):
         if value:
             _validate_http_url(value)
         return value
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def validate_update_allowed_tools(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return _normalize_tool_names(value, "MCP Server allowed tools", allow_empty=True)
+
+    @field_validator("tool_sets")
+    @classmethod
+    def validate_update_tool_sets(
+        cls, value: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        return _normalize_tool_sets(value) if value is not None else None
 
 
 class McpServerRegistry:
@@ -231,6 +260,10 @@ class McpServerRegistry:
             values = changes.model_dump(exclude_unset=True)
             if "mcp_url" in values:
                 self._network_policy.validate_url(values["mcp_url"])
+            _validate_tool_set_membership(
+                values.get("allowed_tools", server.allowed_tools),
+                values.get("tool_sets", server.tool_sets),
+            )
             for name, value in values.items():
                 setattr(server, name, value)
             server.config_version += 1
@@ -263,3 +296,44 @@ def _validate_http_url(value: str) -> None:
         raise ProtocolValidationError("URL must be an absolute HTTP or HTTPS URL.")
     if parsed.username or parsed.password or parsed.fragment:
         raise ProtocolValidationError("URL must not contain credentials or fragments.")
+
+
+def _normalize_tool_names(
+    value: list[str], label: str, *, allow_empty: bool = False
+) -> list[str]:
+    normalized: list[str] = []
+    for item in value:
+        name = item.strip()
+        if not name or len(name) > 200:
+            raise ValueError(f"{label} must contain non-empty names up to 200 characters.")
+        if name not in normalized:
+            normalized.append(name)
+    if not normalized and not allow_empty:
+        raise ValueError(f"{label} must not be empty.")
+    return normalized
+
+
+def _normalize_tool_sets(value: dict[str, list[str]]) -> dict[str, list[str]]:
+    normalized: dict[str, list[str]] = {}
+    for raw_name, raw_tools in value.items():
+        name = raw_name.strip()
+        if not name or len(name) > 100:
+            raise ValueError("MCP Tool Set names must contain 1 to 100 characters.")
+        normalized[name] = _normalize_tool_names(raw_tools, f"MCP Tool Set {name}")
+    return normalized
+
+
+def _validate_tool_set_membership(
+    allowed_tools: list[str], tool_sets: dict[str, list[str]]
+) -> None:
+    unknown = {
+        tool_name
+        for tool_names in tool_sets.values()
+        for tool_name in tool_names
+        if tool_name not in set(allowed_tools)
+    }
+    if unknown:
+        raise ValueError(
+            "MCP Tool Sets contain tools outside the server allowlist: "
+            + ", ".join(sorted(unknown))
+        )

@@ -57,3 +57,14 @@ RECOVERED_RUNS = Counter(
     "Incomplete Runs handled during startup recovery",
     ["outcome"],
 )
+RUN_JOBS_TOTAL = Counter(
+    "ai_agent_run_jobs_total",
+    "Durable Run jobs by lifecycle outcome",
+    ["outcome"],
+)
+RUN_QUEUE_DEPTH = Gauge("ai_agent_run_queue_depth", "Durable Run jobs ready or waiting")
+RUN_QUEUE_OLDEST = Gauge(
+    "ai_agent_run_queue_oldest_seconds",
+    "Age of the oldest durable Run job",
+)
+LIVE_WORKERS = Gauge("ai_agent_live_workers", "Durable Agent Workers with a live heartbeat")

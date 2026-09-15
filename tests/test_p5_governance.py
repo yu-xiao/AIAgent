@@ -18,6 +18,8 @@ from ai_agent.config import (
     CredentialSettings,
     CredentialVaultBackend,
     Environment,
+    ExecutionMode,
+    ExecutionSettings,
     GovernanceSettings,
     ModelSettings,
     OidcSettings,
@@ -95,6 +97,9 @@ def test_production_configuration_requires_governance_and_vault(tmp_path) -> Non
         address="https://vault.example.test",
         token_file=str(secret),
     )
+    with pytest.raises(ConfigurationError, match="external Worker"):
+        settings.validate_runtime()
+    settings.execution = ExecutionSettings(mode=ExecutionMode.EXTERNAL_WORKER)
     settings.validate_runtime()
     assert settings.model.api_key.get_secret_value() == "test-only-secret"
 
@@ -212,6 +217,37 @@ async def test_redis_lua_governance_policies_execute_atomically() -> None:
         await breaker.before("server")
     await breaker.success("server")
     await breaker.before("server")
+    await redis.aclose()
+
+
+async def test_durable_quota_reservation_does_not_hold_concurrency() -> None:
+    redis = FakeRedis()
+    quota = RedisRunQuota(
+        cast(Redis, redis),
+        QuotaSettings(
+            enabled=True,
+            max_concurrent_runs_per_user=1,
+            max_concurrent_runs_per_organization=1,
+            max_runs_per_user_per_minute=3,
+            max_daily_tokens_per_user=1_000,
+            max_daily_tokens_per_organization=1_000,
+        ),
+        RunLimitSettings(max_input_tokens=100, max_output_tokens=20, max_cost_usd=1),
+        lease_seconds=180,
+    )
+    organization_id = uuid4()
+    user_id = uuid4()
+    first = await quota.reserve(organization_id, user_id, "durable-one")
+    second = await quota.reserve(organization_id, user_id, "durable-two")
+
+    await quota.acquire_concurrency(first)
+    with pytest.raises(QuotaExceededError, match="concurrent"):
+        await quota.acquire_concurrency(second)
+
+    await quota.abandon(first)
+    await quota.acquire_concurrency(second)
+    await quota.rollback(first)
+    await quota.rollback(second)
     await redis.aclose()
 
 

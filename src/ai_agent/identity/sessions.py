@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from collections.abc import Awaitable
 from dataclasses import asdict, dataclass
 from typing import Protocol, cast
@@ -71,7 +72,14 @@ class RedisSessionStore:
             json.dumps({"user_id": str(user_id), "csrf_token": session.csrf_token}),
             ex=ttl_seconds,
         )
-        await cast(Awaitable[int], self._redis.sadd(f"user-sessions:{user_id}", session_id))
+        index_key = f"user-sessions:{user_id}"
+        now = time.time()
+        await cast(Awaitable[int], self._redis.zremrangebyscore(index_key, "-inf", now))
+        await cast(
+            Awaitable[int],
+            self._redis.zadd(index_key, {session_id: now + ttl_seconds}),
+        )
+        await cast(Awaitable[bool], self._redis.expire(index_key, ttl_seconds))
         return session_id, session
 
     async def get_session(self, session_id: str) -> AuthSession | None:
@@ -89,12 +97,14 @@ class RedisSessionStore:
             payload = json.loads(_decode(value))
             await cast(
                 Awaitable[int],
-                self._redis.srem(f"user-sessions:{payload['user_id']}", session_id),
+                self._redis.zrem(f"user-sessions:{payload['user_id']}", session_id),
             )
 
     async def delete_user_sessions(self, user_id: UUID) -> int:
         index_key = f"user-sessions:{user_id}"
-        session_ids = await cast(Awaitable[set[bytes | str]], self._redis.smembers(index_key))
+        session_ids = await cast(
+            Awaitable[list[bytes | str]], self._redis.zrange(index_key, 0, -1)
+        )
         if not session_ids:
             return 0
         decoded_ids = [_decode(item) for item in session_ids]

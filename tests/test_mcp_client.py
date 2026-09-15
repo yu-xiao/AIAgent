@@ -3,8 +3,9 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
+import httpx2
 import pytest
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -12,7 +13,7 @@ from pydantic import SecretStr
 
 from ai_agent.errors import ProtocolValidationError
 from ai_agent.mcp.auth import StaticAccessTokenProvider
-from ai_agent.mcp.client import McpProbeClient
+from ai_agent.mcp.client import LimitedAsyncByteStream, McpHttpClient, McpProbeClient
 
 
 @pytest.fixture(scope="module")
@@ -85,6 +86,55 @@ async def test_missing_expected_tool_fails_contract(mcp_url: str) -> None:
 
     with pytest.raises(ProtocolValidationError, match="write_dataset"):
         await client.probe()
+
+
+async def test_response_stream_stops_at_byte_limit() -> None:
+    class Source(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"1234"
+            yield b"5678"
+
+    stream = LimitedAsyncByteStream(Source(), max_bytes=6)
+
+    with pytest.raises(ProtocolValidationError, match="size limit"):
+        _ = [chunk async for chunk in stream]
+
+
+@pytest.mark.parametrize("content_length", ["not-a-number", "-1"])
+async def test_response_rejects_invalid_content_length(content_length: str) -> None:
+    async def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"Content-Length": content_length}, content=b"ok")
+
+    async with McpHttpClient(transport=httpx2.MockTransport(handler)) as client:
+        with pytest.raises(ProtocolValidationError, match="invalid Content-Length"):
+            await client.get("https://mcp.example.test/mcp")
+
+
+async def test_response_rejects_declared_content_length_over_limit() -> None:
+    async def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"Content-Length": "7"}, content=b"1234567")
+
+    async with McpHttpClient(
+        transport=httpx2.MockTransport(handler), max_response_bytes=6
+    ) as client:
+        with pytest.raises(ProtocolValidationError, match="size limit"):
+            await client.get("https://mcp.example.test/mcp")
+
+
+async def test_non_streaming_response_is_limited_while_downloading() -> None:
+    class Source(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"1234"
+            yield b"5678"
+
+    async def handler(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, stream=Source())
+
+    async with McpHttpClient(
+        transport=httpx2.MockTransport(handler), max_response_bytes=6
+    ) as client:
+        with pytest.raises(ProtocolValidationError, match="size limit"):
+            await client.get("https://mcp.example.test/mcp")
 
 
 def _free_port() -> int:

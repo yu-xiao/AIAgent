@@ -43,7 +43,7 @@ class OrganizationConnectionCreate(BaseModel):
     client_secret: SecretStr | None = None
     token_url: str | None = Field(default=None, max_length=2_000)
     scope: str | None = Field(default=None, max_length=500)
-    allowed_tools: list[str] = Field(default_factory=list, max_length=500)
+    allowed_tools: list[str] = Field(min_length=1, max_length=500)
     allowed_tool_sets: list[str] = Field(default_factory=list, max_length=100)
 
 

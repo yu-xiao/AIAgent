@@ -7,10 +7,10 @@ from uuid import uuid4
 
 import pytest
 
-from ai_agent.agents.single_agent import SingleAgent
+from ai_agent.agents.single_agent import AgentUsageBudget, SingleAgent
 from ai_agent.config import RunLimitSettings
 from ai_agent.conversations.service import ConversationService
-from ai_agent.errors import AuthorizationError, ResourceNotFoundError
+from ai_agent.errors import AuthorizationError, ResourceNotFoundError, RunLimitError
 from ai_agent.mcp.models import Citation, RunContext, ToolDefinition, ToolResult
 from ai_agent.models import ModelMessage, ModelStreamEvent, ModelToolCall, ModelUsageResult
 from ai_agent.permission_system.evaluation import (
@@ -167,6 +167,34 @@ class ToolCallingProvider:
         yield ModelStreamEvent(usage=ModelUsageResult(input_tokens=10, output_tokens=2))
 
 
+class BudgetedToolCallingProvider(ToolCallingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_limits: list[int] = []
+
+    async def stream(
+        self,
+        messages: list[ModelMessage],
+        *,
+        max_output_tokens: int,
+        trace_id: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        del trace_id
+        self.output_limits.append(max_output_tokens)
+        self.round += 1
+        if self.round == 1:
+            assert tools
+            yield ModelStreamEvent(
+                tool_calls=(ModelToolCall(id="call-budget", name="list_datasets", arguments={}),)
+            )
+            yield ModelStreamEvent(usage=ModelUsageResult(input_tokens=10, output_tokens=2))
+            return
+        assert messages[-1].role == "tool"
+        yield ModelStreamEvent(delta="Budgeted answer")
+        yield ModelStreamEvent(usage=ModelUsageResult(input_tokens=10, output_tokens=1))
+
+
 class FakeAgentGateway(FakePermissionGateway):
     async def list_tools(
         self,
@@ -229,6 +257,50 @@ async def test_single_agent_executes_mcp_tool_and_returns_citation() -> None:
     assert result.citations[0].tool_name == "list_datasets"
     assert result.tool_invocations[0].arguments_digest
     assert deltas == ["Authorized datasets found."]
+
+
+async def test_single_agent_carries_remaining_output_budget_across_rounds() -> None:
+    provider = BudgetedToolCallingProvider()
+    result = await SingleAgent(provider).run(
+        [ModelMessage(role="user", content="list my datasets")],
+        max_output_tokens=3,
+        trace_id="trace-budget",
+        on_delta=lambda delta: _record_delta([], delta),
+        gateway=FakeAgentGateway(),
+        context=_context(),
+        max_model_rounds=3,
+        usage_budget=AgentUsageBudget(
+            max_input_tokens=5_000,
+            max_output_tokens=3,
+            max_cost_usd=1,
+            input_price_per_million_tokens=1,
+            output_price_per_million_tokens=1,
+        ),
+    )
+
+    assert result.answer == "Budgeted answer"
+    assert result.usage.output_tokens == 3
+    assert provider.output_limits == [3, 1]
+
+
+async def test_single_agent_rejects_next_round_when_input_budget_is_exhausted() -> None:
+    with pytest.raises(RunLimitError, match="input Token budget"):
+        await SingleAgent(BudgetedToolCallingProvider()).run(
+            [ModelMessage(role="user", content="list my datasets")],
+            max_output_tokens=100,
+            trace_id="trace-budget",
+            on_delta=lambda delta: _record_delta([], delta),
+            gateway=FakeAgentGateway(),
+            context=_context(),
+            max_model_rounds=3,
+            usage_budget=AgentUsageBudget(
+                max_input_tokens=50,
+                max_output_tokens=100,
+                max_cost_usd=1,
+                input_price_per_million_tokens=1,
+                output_price_per_million_tokens=1,
+            ),
+        )
 
 
 async def _record_delta(deltas: list[str], delta: str) -> None:

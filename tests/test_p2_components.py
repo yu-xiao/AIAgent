@@ -14,11 +14,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import Response
 from mcp.types import CallToolResult, TextContent
 from pydantic import SecretStr
+from sqlalchemy import select
 
 from ai_agent.config import PlatformSettings, TokenEndpointAuthMethod
 from ai_agent.connections.service import ConnectionService
 from ai_agent.credentials.vault import MemoryCredentialVault
 from ai_agent.errors import (
+    AuthorizationError,
     CircuitOpenError,
     GatewayTimeoutError,
     ProtocolValidationError,
@@ -29,9 +31,10 @@ from ai_agent.identity.sessions import MemorySessionStore
 from ai_agent.mcp.gateway import McpGateway
 from ai_agent.mcp.models import RunContext, ToolDescriptor
 from ai_agent.mcp.registry import McpServerRegistry, McpServerSpec
+from ai_agent.mcp.schema import validate_instance, validate_schema
 from ai_agent.mcp.tool_catalog import MemoryCatalogCache, ToolCatalogService
 from ai_agent.persistence import Database
-from ai_agent.persistence.models import Base, McpAuthMode
+from ai_agent.persistence.models import Base, CredentialReference, McpAuthMode
 
 
 class FakeMcpClient:
@@ -103,6 +106,8 @@ async def test_registry_and_catalog_are_tenant_scoped(p2_runtime) -> None:
         organization.id,
         "permission",
         access_token=SecretStr("opaque-token"),
+        allowed_tools=["permission.search"],
+        allowed_tool_sets=["permission"],
     )
     fake = FakeMcpClient(
         [
@@ -131,6 +136,198 @@ async def test_registry_and_catalog_are_tenant_scoped(p2_runtime) -> None:
     assert await vault.get(connection.credential_reference) is not None
 
 
+async def test_empty_connection_allowlist_is_fail_closed(p2_runtime) -> None:
+    _, _, user, organization, registry, connections, _ = p2_runtime
+    server = await registry.create(
+        user.id,
+        organization.id,
+        McpServerSpec(
+            code="fail-closed",
+            display_name="Fail Closed",
+            system_code="permission-system",
+            mcp_url="https://mcp.example.test/mcp",
+            auth_mode=McpAuthMode.API_KEY,
+            allowed_tools=["read"],
+        ),
+    )
+    with pytest.raises(ProtocolValidationError, match="explicit non-empty"):
+        await connections.create_organization_connection(
+            user.id,
+            organization.id,
+            server.code,
+            access_token=SecretStr("opaque-token"),
+        )
+    with pytest.raises(AuthorizationError, match="exceeds"):
+        await connections.create_organization_connection(
+            user.id,
+            organization.id,
+            server.code,
+            access_token=SecretStr("opaque-token"),
+            allowed_tools=["write"],
+        )
+
+
+async def test_connection_rotation_invalidates_effective_catalog_cache(p2_runtime) -> None:
+    _, _, user, organization, registry, connections, _ = p2_runtime
+    await registry.create(
+        user.id,
+        organization.id,
+        McpServerSpec(
+            code="rotated-policy",
+            display_name="Rotated Policy",
+            system_code="permission-system",
+            mcp_url="https://mcp.example.test/mcp",
+            auth_mode=McpAuthMode.API_KEY,
+            allowed_tools=["read", "write"],
+        ),
+    )
+    await connections.create_organization_connection(
+        user.id,
+        organization.id,
+        "rotated-policy",
+        access_token=SecretStr("first-token"),
+        allowed_tools=["read"],
+    )
+    fake = FakeMcpClient(
+        [
+            ToolDescriptor(name="read", input_schema={"type": "object"}),
+            ToolDescriptor(name="write", input_schema={"type": "object"}),
+        ]
+    )
+    catalog = ToolCatalogService(
+        registry,
+        connections,
+        MemoryCatalogCache(),
+        client_factory=lambda *_: fake,
+    )
+    context = RunContext(
+        organization_id=organization.id,
+        user_id=user.id,
+        trace_id=str(uuid4()),
+    )
+    assert [tool.name for tool in await catalog.list_tools(context)] == ["read"]
+
+    await connections.create_organization_connection(
+        user.id,
+        organization.id,
+        "rotated-policy",
+        access_token=SecretStr("second-token"),
+        allowed_tools=["write"],
+    )
+
+    assert [tool.name for tool in await catalog.list_tools(context)] == ["write"]
+
+
+def test_standard_json_schema_keywords_are_enforced() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "pattern": "^[a-z]+$"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 3},
+        },
+        "required": ["code", "count"],
+        "additionalProperties": False,
+    }
+    validate_instance({"code": "valid", "count": 2}, schema, label="test input")
+    with pytest.raises(ProtocolValidationError, match="validation failed"):
+        validate_instance({"code": "INVALID", "count": 4}, schema, label="test input")
+    with pytest.raises(ProtocolValidationError, match="valid JSON Schema"):
+        validate_schema({"type": "unknown"}, label="test schema")
+    with pytest.raises(ProtocolValidationError, match="only local"):
+        validate_schema(
+            {"$ref": "https://schemas.example.test/tool.json"},
+            label="test schema",
+        )
+    local_reference_schema = {
+        "$defs": {"identifier": {"type": "string", "minLength": 1}},
+        "properties": {"id": {"$ref": "#/$defs/identifier"}},
+    }
+    validate_schema(local_reference_schema, label="test schema")
+    validate_instance({"id": "valid"}, local_reference_schema, label="test input")
+
+
+async def test_uncommitted_organization_credential_is_revoked(
+    p2_runtime, monkeypatch
+) -> None:
+    _, _, user, organization, registry, connections, vault = p2_runtime
+    await registry.create(
+        user.id,
+        organization.id,
+        McpServerSpec(
+            code="rollback-secret",
+            display_name="Rollback Secret",
+            system_code="permission-system",
+            mcp_url="https://mcp.example.test/mcp",
+            auth_mode=McpAuthMode.API_KEY,
+            allowed_tools=["read"],
+        ),
+    )
+
+    async def fail_persistence(**_: Any):
+        raise RuntimeError("database failed")
+
+    monkeypatch.setattr(connections, "_persist_organization_connection", fail_persistence)
+    with pytest.raises(RuntimeError, match="database failed"):
+        await connections.create_organization_connection(
+            user.id,
+            organization.id,
+            "rollback-secret",
+            access_token=SecretStr("must-be-revoked"),
+            allowed_tools=["read"],
+        )
+
+    assert vault._values == {}
+
+
+async def test_pending_credential_revocation_is_retried(p2_runtime, monkeypatch) -> None:
+    database, _, user, organization, registry, connections, vault = p2_runtime
+    await registry.create(
+        user.id,
+        organization.id,
+        McpServerSpec(
+            code="retry-revocation",
+            display_name="Retry Revocation",
+            system_code="permission-system",
+            mcp_url="https://mcp.example.test/mcp",
+            auth_mode=McpAuthMode.API_KEY,
+            allowed_tools=["read"],
+        ),
+    )
+    first = await connections.create_organization_connection(
+        user.id,
+        organization.id,
+        "retry-revocation",
+        access_token=SecretStr("first-token"),
+        allowed_tools=["read"],
+    )
+    first_reference = first.credential_reference
+    original_revoke = vault.revoke
+
+    async def fail_revoke(_: str) -> None:
+        raise RuntimeError("vault unavailable")
+
+    monkeypatch.setattr(vault, "revoke", fail_revoke)
+    await connections.create_organization_connection(
+        user.id,
+        organization.id,
+        "retry-revocation",
+        access_token=SecretStr("second-token"),
+        allowed_tools=["read"],
+    )
+    monkeypatch.setattr(vault, "revoke", original_revoke)
+
+    assert await connections.retry_pending_revocations() == 1
+    async with database.session_factory() as session:
+        stored = await session.scalar(
+            select(CredentialReference).where(
+                CredentialReference.reference == first_reference
+            )
+        )
+    assert stored is not None
+    assert stored.status == "revoked"
+    assert await vault.get(first_reference) is None
+
+
 async def test_gateway_validates_input_and_enforces_rate_limit(p2_runtime) -> None:
     _, _, user, organization, registry, connections, _ = p2_runtime
     await registry.create(
@@ -151,6 +348,7 @@ async def test_gateway_validates_input_and_enforces_rate_limit(p2_runtime) -> No
         organization.id,
         "search",
         access_token=SecretStr("opaque-token"),
+        allowed_tools=["search"],
     )
     fake = FakeMcpClient(
         [ToolDescriptor(name="search", input_schema={"type": "object", "required": ["q"]})],
@@ -193,6 +391,7 @@ async def test_gateway_timeout_opens_circuit(p2_runtime) -> None:
         organization.id,
         "slow",
         access_token=SecretStr("opaque-token"),
+        allowed_tools=["slow"],
     )
 
     class SlowClient(FakeMcpClient):
@@ -341,6 +540,7 @@ async def test_connection_center_api_hides_secret_and_requires_csrf(platform_run
             "system_code": "permission-system",
             "mcp_url": "https://mcp.example.test/mcp",
             "auth_mode": "api_key",
+            "allowed_tools": ["read"],
         },
     )
     assert without_csrf.status_code == 403
@@ -353,13 +553,18 @@ async def test_connection_center_api_hides_secret_and_requires_csrf(platform_run
             "system_code": "permission-system",
             "mcp_url": "https://mcp.example.test/mcp",
             "auth_mode": "api_key",
+            "allowed_tools": ["read"],
         },
     )
     assert created.status_code == 201
     connection = await runtime.client.post(
         "/api/v1/organization-connections",
         headers=runtime.headers,
-        json={"server_code": "api-server", "access_token": "do-not-return"},
+        json={
+            "server_code": "api-server",
+            "access_token": "do-not-return",
+            "allowed_tools": ["read"],
+        },
     )
     assert connection.status_code == 201
     assert "access_token" not in connection.text
@@ -383,6 +588,7 @@ async def test_organization_client_credentials_are_exchanged_before_storage(p2_r
             token_endpoint="https://id.example.test/token",
             token_endpoint_auth_method=TokenEndpointAuthMethod.CLIENT_SECRET_BASIC,
             required_scope="business.read",
+            allowed_tools=["read"],
         ),
     )
     route = respx.post("https://id.example.test/token").mock(
@@ -397,6 +603,7 @@ async def test_organization_client_credentials_are_exchanged_before_storage(p2_r
         "service",
         client_id="service-client",
         client_secret=SecretStr("service-secret"),
+        allowed_tools=["read"],
     )
     assert route.call_count == 1
     stored = await vault.get(connection.credential_reference)

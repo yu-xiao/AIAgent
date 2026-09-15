@@ -356,18 +356,29 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     async def p5_status() -> dict[str, object]:
         governance = runtime_settings.governance
         runs_enabled = runtime_settings.platform.runs_enabled
+        worker_available = runtime_settings.execution.mode.value == "embedded"
         if app.state.services is not None and app.state.services.quota is not None:
             runs_enabled = runs_enabled and await app.state.services.quota.runs_enabled()
+        if (
+            app.state.services is not None
+            and app.state.services.worker_registry is not None
+            and not worker_available
+        ):
+            worker_available = await app.state.services.worker_registry.has_live_workers()
+            runs_enabled = runs_enabled and worker_available
         return {
             "phase": "P5",
             "enabled": governance.enabled,
             "runs_enabled": runs_enabled,
+            "execution_mode": runtime_settings.execution.mode.value,
+            "worker_available": worker_available,
             "capabilities": {
                 "distributed_quotas": governance.quota.enabled,
                 "durable_credential_vault": runtime_settings.credentials.backend.value
                 == "hashicorp_vault",
                 "distributed_mcp_policies": True,
                 "graceful_shutdown_and_recovery": True,
+                "durable_run_jobs": runtime_settings.execution.mode.value == "external_worker",
                 "prometheus_metrics_and_alerts": True,
                 "optional_otlp_tracing": runtime_settings.observability.tracing_enabled,
                 "audit_retention": True,

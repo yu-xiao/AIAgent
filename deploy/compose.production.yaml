@@ -9,6 +9,7 @@ x-api: &api
     - redis_password
     - model_api_key
     - vault_token
+    - audit_integrity_key
   read_only: true
   tmpfs:
     - /tmp:size=64m,mode=1777
@@ -71,6 +72,20 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  worker:
+    <<: *api
+    image: ${AI_AGENT_WORKER_IMAGE:?set AI_AGENT_WORKER_IMAGE}
+    command: ["ai-agent", "worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "ai-agent", "worker-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   proxy:
     image: nginxinc/nginx-unprivileged:1.29-alpine
@@ -148,6 +163,8 @@ secrets:
     file: ${AI_AGENT_MODEL_API_KEY_FILE:?set AI_AGENT_MODEL_API_KEY_FILE}
   vault_token:
     file: ${AI_AGENT_VAULT_TOKEN_FILE:?set AI_AGENT_VAULT_TOKEN_FILE}
+  audit_integrity_key:
+    file: ${AI_AGENT_AUDIT_INTEGRITY_KEY_FILE:?set AI_AGENT_AUDIT_INTEGRITY_KEY_FILE}
   tls_certificate:
     file: ${AI_AGENT_TLS_CERTIFICATE_FILE:?set AI_AGENT_TLS_CERTIFICATE_FILE}
   tls_private_key:

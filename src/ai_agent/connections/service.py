@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from pydantic import SecretStr
@@ -43,6 +45,8 @@ from ai_agent.persistence.models import (
     utc_now,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ConnectionService:
     def __init__(
@@ -56,6 +60,7 @@ class ConnectionService:
         default_client_id: str = "ai-agent-web",
         default_timeout_seconds: float = 10.0,
         signing_algorithms: tuple[str, ...] = ("RS256",),
+        network_policy: Any | None = None,
         audit: AuditService | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -70,6 +75,7 @@ class ConnectionService:
             signing_algorithms=signing_algorithms,
             timeout_seconds=default_timeout_seconds,
         )
+        self._network_policy = network_policy
         self._audit = audit or AuditService()
 
     async def begin_personal_authorization(
@@ -164,36 +170,70 @@ class ConnectionService:
             if server is None:
                 raise ResourceNotFoundError("MCP Server is not registered or enabled.")
             grant.used_at = utc_now()
-            metadata = await self._authorization_metadata(server)
-            transaction = AuthorizationTransaction(
-                authorization_url="",
-                state=stored.state,
-                nonce=stored.nonce,
-                code_verifier=SecretStr(stored.code_verifier),
+            organization_id = grant.organization_id
+        metadata = await self._authorization_metadata(server)
+        transaction = AuthorizationTransaction(
+            authorization_url="",
+            state=stored.state,
+            nonce=stored.nonce,
+            code_verifier=SecretStr(stored.code_verifier),
+        )
+        token = await self._oauth_client(
+            server, client_secret=await self._oauth_client_secret(server)
+        ).exchange_code(
+            token_endpoint=metadata.token_endpoint,
+            code=code,
+            transaction=transaction,
+            returned_state=state,
+        )
+        subject = await _subject_from_token(
+            token,
+            metadata,
+            stored.nonce,
+            self._oauth_client_id(server),
+            validator=self._id_token_validator,
+        )
+        credential = _credential_from_token(token)
+        access_reference = await self._vault.put(credential)
+        try:
+            connection, reference_to_revoke = await self._persist_personal_connection(
+                user_id=user_id,
+                organization_id=organization_id,
+                server=server,
+                metadata=metadata,
+                subject=subject,
+                token=token,
+                credential=credential,
+                access_reference=access_reference,
+                trace_id=trace_id,
             )
-            token = await self._oauth_client(
-                server, client_secret=await self._oauth_client_secret(server)
-            ).exchange_code(
-                token_endpoint=metadata.token_endpoint,
-                code=code,
-                transaction=transaction,
-                returned_state=state,
-            )
-            subject = await _subject_from_token(
-                token,
-                metadata,
-                stored.nonce,
-                self._oauth_client_id(server),
-                validator=self._id_token_validator,
-            )
-            credential = _credential_from_token(token)
-            access_reference = await self._vault.put(credential)
-            reference_to_revoke: str | None = None
+        except Exception:
+            await self._revoke_uncommitted_reference(access_reference)
+            raise
+        if reference_to_revoke is not None:
+            await self._revoke_reference(reference_to_revoke)
+        return connection
+
+    async def _persist_personal_connection(
+        self,
+        *,
+        user_id: UUID,
+        organization_id: UUID,
+        server: McpServerDefinition,
+        metadata: OidcProviderMetadata,
+        subject: str,
+        token: OAuthToken,
+        credential: Credential,
+        access_reference: str,
+        trace_id: UUID | None,
+    ) -> tuple[ExternalConnection, str | None]:
+        reference_to_revoke: str | None = None
+        async with self._session_factory() as session, session.begin():
             previous = await session.scalar(
                 select(ExternalConnection)
                 .where(
-                    ExternalConnection.organization_id == grant.organization_id,
-                    ExternalConnection.server_id == grant.server_id,
+                    ExternalConnection.organization_id == organization_id,
+                    ExternalConnection.server_id == server.id,
                     ExternalConnection.owner_user_id == user_id,
                     ExternalConnection.ownership == ConnectionOwnership.PERSONAL,
                 )
@@ -202,15 +242,15 @@ class ConnectionService:
             if previous is None:
                 session.add(
                     CredentialReference(
-                        organization_id=grant.organization_id,
+                        organization_id=organization_id,
                         reference=access_reference,
                         vault_kind=self._vault.kind,
                         expires_at=credential.expires_at,
                     )
                 )
                 connection = ExternalConnection(
-                    organization_id=grant.organization_id,
-                    server_id=grant.server_id,
+                    organization_id=organization_id,
+                    server_id=server.id,
                     owner_user_id=user_id,
                     ownership=ConnectionOwnership.PERSONAL,
                     status=ConnectionStatus.ACTIVE,
@@ -219,6 +259,8 @@ class ConnectionService:
                     scopes=_scopes(token, server),
                     credential_reference=access_reference,
                     expires_at=credential.expires_at,
+                    allowed_tools=list(server.allowed_tools),
+                    allowed_tool_sets=list(server.tool_sets),
                 )
                 session.add(connection)
                 await session.flush()
@@ -234,7 +276,7 @@ class ConnectionService:
                     old_reference.status = "revocation_pending"
                 session.add(
                     CredentialReference(
-                        organization_id=grant.organization_id,
+                        organization_id=organization_id,
                         reference=access_reference,
                         vault_kind=self._vault.kind,
                         expires_at=credential.expires_at,
@@ -246,9 +288,11 @@ class ConnectionService:
                 connection.scopes = _scopes(token, server)
                 connection.credential_reference = access_reference
                 connection.expires_at = credential.expires_at
+                connection.allowed_tools = list(server.allowed_tools)
+                connection.allowed_tool_sets = list(server.tool_sets)
             session.add(
                 self._audit.record(
-                    organization_id=grant.organization_id,
+                    organization_id=organization_id,
                     actor_user_id=user_id,
                     action="connection.authorization_succeeded",
                     resource_type="external_connection",
@@ -257,10 +301,7 @@ class ConnectionService:
                     details={"server_code": server.code, "scope": _scopes(token, server)},
                 )
             )
-        if reference_to_revoke is not None:
-            await self._vault.revoke(reference_to_revoke)
-            await self._mark_reference_revoked(reference_to_revoke)
-        return connection
+        return connection, reference_to_revoke
 
     async def create_organization_connection(
         self,
@@ -281,6 +322,23 @@ class ConnectionService:
         server = await self._server(server_code, organization_id, enabled=True)
         if server.auth_mode not in {McpAuthMode.CLIENT_CREDENTIALS, McpAuthMode.API_KEY}:
             raise ConflictError("MCP Server is not configured for an organization connection.")
+        selected_tools = list(dict.fromkeys(allowed_tools or []))
+        if not selected_tools:
+            raise ProtocolValidationError(
+                "Organization connections require an explicit non-empty Tool allowlist."
+            )
+        unknown_tools = set(selected_tools) - set(server.allowed_tools)
+        if unknown_tools:
+            raise AuthorizationError(
+                "Organization connection Tool allowlist exceeds the MCP Server allowlist."
+            )
+        selected_tool_sets = list(dict.fromkeys(allowed_tool_sets or []))
+        unknown_tool_sets = set(selected_tool_sets) - set(server.tool_sets)
+        if unknown_tool_sets:
+            raise AuthorizationError(
+                "Organization connection Tool Sets are not registered by the MCP Server."
+            )
+        token: OAuthToken | None = None
         if access_token is None or not access_token.get_secret_value():
             if server.auth_mode != McpAuthMode.CLIENT_CREDENTIALS:
                 raise AuthenticationError("Organization connection access token is required.")
@@ -299,17 +357,59 @@ class ConnectionService:
                 scope=scope or server.required_scope,
                 auth_method=TokenEndpointAuthMethod(server.token_endpoint_auth_method),
                 timeout_seconds=self._default_timeout_seconds,
+                network_policy=self._network_policy,
             )
-            access_token = await provider.get_access_token()
-            expires_at = datetime.now(UTC) + timedelta(seconds=300)
+            token = await provider.get_token()
+            access_token = token.access_token
+            expires_at = datetime.now(UTC) + timedelta(seconds=token.expires_in)
         else:
             expires_at = None
         credential = Credential(
             access_token=access_token,
-            client_secret=client_secret,
+            token_type=token.token_type if token is not None else "Bearer",
+            client_secret=client_secret if token is not None else None,
             expires_at=expires_at,
+            client_id=client_id if token is not None else None,
+            token_url=(token_url or server.token_endpoint) if token is not None else None,
+            scope=(scope or server.required_scope) if token is not None else "",
+            token_endpoint_auth_method=(
+                server.token_endpoint_auth_method if token is not None else None
+            ),
         )
         reference = await self._vault.put(credential)
+        persisted_expires_at = None if token is not None else expires_at
+        try:
+            connection, reference_to_revoke = await self._persist_organization_connection(
+                actor_id=actor_id,
+                organization_id=organization_id,
+                server=server,
+                reference=reference,
+                expires_at=persisted_expires_at,
+                scope=scope,
+                selected_tools=selected_tools,
+                selected_tool_sets=selected_tool_sets,
+                trace_id=trace_id,
+            )
+        except Exception:
+            await self._revoke_uncommitted_reference(reference)
+            raise
+        if reference_to_revoke is not None:
+            await self._revoke_reference(reference_to_revoke)
+        return connection
+
+    async def _persist_organization_connection(
+        self,
+        *,
+        actor_id: UUID,
+        organization_id: UUID,
+        server: McpServerDefinition,
+        reference: str,
+        expires_at: datetime | None,
+        scope: str | None,
+        selected_tools: list[str],
+        selected_tool_sets: list[str],
+        trace_id: UUID | None,
+    ) -> tuple[ExternalConnection, str | None]:
         reference_to_revoke: str | None = None
         async with self._session_factory() as session, session.begin():
             existing = await session.scalar(
@@ -342,8 +442,8 @@ class ConnectionService:
                 )
                 existing.status = ConnectionStatus.ACTIVE
                 existing.credential_reference = reference
-                existing.allowed_tools = allowed_tools or []
-                existing.allowed_tool_sets = allowed_tool_sets or []
+                existing.allowed_tools = selected_tools
+                existing.allowed_tool_sets = selected_tool_sets
                 connection = existing
             else:
                 session.add(
@@ -364,8 +464,8 @@ class ConnectionService:
                     if scope or server.required_scope
                     else [],
                     credential_reference=reference,
-                    allowed_tools=allowed_tools or [],
-                    allowed_tool_sets=allowed_tool_sets or [],
+                    allowed_tools=selected_tools,
+                    allowed_tool_sets=selected_tool_sets,
                 )
                 session.add(connection)
                 await session.flush()
@@ -384,10 +484,38 @@ class ConnectionService:
                     details={"server_code": server.code, "allowed_tools": connection.allowed_tools},
                 )
             )
-        if reference_to_revoke is not None:
-            await self._vault.revoke(reference_to_revoke)
-            await self._mark_reference_revoked(reference_to_revoke)
-        return connection
+        return connection, reference_to_revoke
+
+    async def _revoke_uncommitted_reference(self, reference: str) -> None:
+        try:
+            await self._vault.revoke(reference)
+        except Exception:
+            logger.exception("Failed to revoke an uncommitted Vault credential reference.")
+
+    async def _revoke_reference(self, reference: str) -> bool:
+        try:
+            await self._vault.revoke(reference)
+        except Exception:
+            logger.exception("Credential revocation remains pending.")
+            return False
+        await self._mark_reference_revoked(reference)
+        return True
+
+    async def retry_pending_revocations(self, *, limit: int = 100) -> int:
+        async with self._session_factory() as session:
+            references = list(
+                await session.scalars(
+                    select(CredentialReference.reference)
+                    .where(CredentialReference.status == "revocation_pending")
+                    .order_by(CredentialReference.updated_at, CredentialReference.id)
+                    .limit(limit)
+                )
+            )
+        completed = 0
+        for reference in references:
+            if await self._revoke_reference(reference):
+                completed += 1
+        return completed
 
     async def list_connections(
         self, user_id: UUID, organization_id: UUID
@@ -469,6 +597,65 @@ class ConnectionService:
         """Refresh a personal OAuth token and rotate its vault reference."""
 
         await self._identities.access(user_id, organization_id, CONNECTION_PERSONAL_CREATE)
+        async with self._session_factory() as session:
+            connection = await session.scalar(
+                select(ExternalConnection)
+                .where(
+                    ExternalConnection.id == connection_id,
+                    ExternalConnection.organization_id == organization_id,
+                    ExternalConnection.owner_user_id == user_id,
+                    ExternalConnection.ownership == ConnectionOwnership.PERSONAL,
+                )
+            )
+            if connection is None:
+                raise ResourceNotFoundError("Personal external connection not found.")
+            server = await session.get(McpServerDefinition, connection.server_id)
+            if server is None or server.auth_mode != McpAuthMode.OAUTH_AUTHORIZATION_CODE:
+                raise ConflictError("Connection does not support OAuth refresh.")
+            current = await self._vault.get(connection.credential_reference)
+            if current is None or current.refresh_token is None:
+                raise AuthenticationError("External connection has no refresh token.")
+            previous_reference = connection.credential_reference
+        metadata = await self._authorization_metadata(server)
+        token = await self._oauth_client(
+            server, client_secret=await self._oauth_client_secret(server)
+        ).refresh_token(
+            token_endpoint=metadata.token_endpoint,
+            refresh_token=current.refresh_token,
+        )
+        credential = _credential_from_token(token)
+        if credential.refresh_token is None:
+            credential.refresh_token = current.refresh_token
+        reference = await self._vault.put(credential)
+        try:
+            connection = await self._persist_personal_refresh(
+                user_id=user_id,
+                organization_id=organization_id,
+                connection_id=connection_id,
+                previous_reference=previous_reference,
+                reference=reference,
+                credential=credential,
+                server=server,
+                trace_id=trace_id,
+            )
+        except Exception:
+            await self._revoke_uncommitted_reference(reference)
+            raise
+        await self._revoke_reference(previous_reference)
+        return connection
+
+    async def _persist_personal_refresh(
+        self,
+        *,
+        user_id: UUID,
+        organization_id: UUID,
+        connection_id: UUID,
+        previous_reference: str,
+        reference: str,
+        credential: Credential,
+        server: McpServerDefinition,
+        trace_id: UUID | None,
+    ) -> ExternalConnection:
         async with self._session_factory() as session, session.begin():
             connection = await session.scalar(
                 select(ExternalConnection)
@@ -482,26 +669,11 @@ class ConnectionService:
             )
             if connection is None:
                 raise ResourceNotFoundError("Personal external connection not found.")
-            server = await session.get(McpServerDefinition, connection.server_id)
-            if server is None or server.auth_mode != McpAuthMode.OAUTH_AUTHORIZATION_CODE:
-                raise ConflictError("Connection does not support OAuth refresh.")
-            current = await self._vault.get(connection.credential_reference)
-            if current is None or current.refresh_token is None:
-                raise AuthenticationError("External connection has no refresh token.")
-            metadata = await self._authorization_metadata(server)
-            token = await self._oauth_client(
-                server, client_secret=await self._oauth_client_secret(server)
-            ).refresh_token(
-                token_endpoint=metadata.token_endpoint,
-                refresh_token=current.refresh_token,
-            )
-            credential = _credential_from_token(token)
-            if credential.refresh_token is None:
-                credential.refresh_token = current.refresh_token
-            reference = await self._vault.put(credential)
+            if connection.credential_reference != previous_reference:
+                raise ConflictError("External connection credentials changed during refresh.")
             old_reference = await session.scalar(
                 select(CredentialReference).where(
-                    CredentialReference.reference == connection.credential_reference
+                    CredentialReference.reference == previous_reference
                 )
             )
             if old_reference:
@@ -514,7 +686,6 @@ class ConnectionService:
                     expires_at=credential.expires_at,
                 )
             )
-            reference_to_revoke = connection.credential_reference
             connection.credential_reference = reference
             connection.expires_at = credential.expires_at
             connection.status = ConnectionStatus.ACTIVE
@@ -529,8 +700,6 @@ class ConnectionService:
                     details={"server_code": server.code},
                 )
             )
-        await self._vault.revoke(reference_to_revoke)
-        await self._mark_reference_revoked(reference_to_revoke)
         return connection
 
     async def _mark_reference_revoked(self, reference: str) -> None:

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import time
+from uuid import uuid4
+
 import pytest
+from fakeredis.aioredis import FakeRedis
 from sqlalchemy import select
 
 from ai_agent.errors import AuthorizationError, ConflictError, ResourceNotFoundError
+from ai_agent.identity.sessions import RedisSessionStore
 from ai_agent.persistence.models import AuditLog, OrganizationMember, User
 from tests.p1_conftest import PlatformRuntime
 
@@ -127,3 +132,20 @@ async def test_session_store_can_revoke_all_user_sessions(
     assert deleted == 3
     assert await runtime.services.sessions.get_session(first_id) is None
     assert await runtime.services.sessions.get_session(second_id) is None
+
+
+async def test_redis_session_index_removes_expired_entries() -> None:
+    redis = FakeRedis()
+    store = RedisSessionStore(redis)  # type: ignore[arg-type]
+    user_id = uuid4()
+    first_id, _ = await store.create_session(user_id, 300)
+    index_key = f"user-sessions:{user_id}"
+    await redis.zadd(index_key, {"expired-session": time.time() - 1})
+
+    second_id, _ = await store.create_session(user_id, 300)
+
+    assert await redis.zscore(index_key, "expired-session") is None
+    assert await store.delete_user_sessions(user_id) == 2
+    assert await store.get_session(first_id) is None
+    assert await store.get_session(second_id) is None
+    await redis.aclose()

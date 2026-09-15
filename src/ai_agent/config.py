@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_agent.errors import ConfigurationError
@@ -28,6 +28,11 @@ class TokenEndpointAuthMethod(StrEnum):
 class CredentialVaultBackend(StrEnum):
     MEMORY = "memory"
     HASHICORP_VAULT = "hashicorp_vault"
+
+
+class ExecutionMode(StrEnum):
+    EMBEDDED = "embedded"
+    EXTERNAL_WORKER = "external_worker"
 
 
 class OidcSettings(BaseModel):
@@ -198,6 +203,28 @@ class GovernanceSettings(BaseModel):
     quota: QuotaSettings = Field(default_factory=QuotaSettings)
 
 
+class ExecutionSettings(BaseModel):
+    mode: ExecutionMode = ExecutionMode.EMBEDDED
+    lease_seconds: int = Field(default=45, ge=15, le=600)
+    heartbeat_seconds: int = Field(default=10, ge=1, le=120)
+    worker_stale_seconds: int = Field(default=30, ge=5, le=600)
+    poll_interval_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
+    retry_delay_seconds: float = Field(default=2.0, ge=0.1, le=300.0)
+    retry_max_delay_seconds: float = Field(default=60.0, ge=0.1, le=3_600.0)
+    retry_jitter_ratio: float = Field(default=0.2, ge=0.0, le=0.5)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_lease_timing(self) -> ExecutionSettings:
+        if self.heartbeat_seconds * 2 >= self.lease_seconds:
+            raise ValueError("Execution lease must exceed twice the heartbeat interval.")
+        if self.heartbeat_seconds * 2 >= self.worker_stale_seconds:
+            raise ValueError("Worker stale interval must exceed twice the heartbeat interval.")
+        if self.retry_max_delay_seconds < self.retry_delay_seconds:
+            raise ValueError("Execution retry maximum delay must not be less than its base delay.")
+        return self
+
+
 class ObservabilitySettings(BaseModel):
     tracing_enabled: bool = False
     service_name: str = "enterprise-ai-agent"
@@ -266,6 +293,7 @@ class Settings(BaseSettings):
     mcp_gateway: McpGatewaySettings = Field(default_factory=McpGatewaySettings)
     credentials: CredentialSettings = Field(default_factory=CredentialSettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
 
@@ -447,6 +475,8 @@ class Settings(BaseSettings):
             )
         if self.credentials.backend != CredentialVaultBackend.HASHICORP_VAULT:
             raise ConfigurationError("Production platform requires the HashiCorp Vault backend.")
+        if self.execution.mode != ExecutionMode.EXTERNAL_WORKER:
+            raise ConfigurationError("Production platform requires external Worker execution.")
         if not self.platform.database_password_file:
             raise ConfigurationError("Production database password must be loaded from a file.")
         if not self.platform.redis_password_file:

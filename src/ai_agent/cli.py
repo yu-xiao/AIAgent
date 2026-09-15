@@ -14,7 +14,7 @@ import uvicorn
 from redis.asyncio import Redis
 
 from ai_agent.audit.service import AuditService
-from ai_agent.config import Settings
+from ai_agent.config import ExecutionMode, Settings
 from ai_agent.errors import AiAgentError, ConfigurationError
 from ai_agent.governance.quota import RedisRunQuota
 from ai_agent.governance.retention import AuditRetentionService
@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Run the P0 FastAPI service")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+
+    subparsers.add_parser("worker", help="Run the durable Agent Worker")
+    subparsers.add_parser("worker-health", help="Check for a live durable Agent Worker")
 
     prune = subparsers.add_parser("prune-audit", help="Apply configured audit retention")
     prune.add_argument(
@@ -110,6 +113,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 forwarded_allow_ips=list(settings.security.trusted_proxy_ips),
             )
             return 0
+        if args.command == "worker":
+            return asyncio.run(_run_worker(settings))
+        if args.command == "worker-health":
+            return asyncio.run(_worker_health(settings))
         if args.command == "prune-audit":
             return asyncio.run(_prune_audit(settings, execute=args.execute))
         if args.command == "verify-audit":
@@ -127,6 +134,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 2
+
+
+async def _run_worker(settings: Settings) -> int:
+    settings.validate_runtime()
+    if settings.execution.mode != ExecutionMode.EXTERNAL_WORKER:
+        raise ConfigurationError("Durable Worker requires external_worker execution mode.")
+    from ai_agent.runs.worker import RunWorker
+    from ai_agent.runtime import build_services
+
+    services = build_services(settings)
+    try:
+        await services.start(settings)
+        if services.jobs is None or services.worker_registry is None:
+            raise ConfigurationError("Durable Worker services are unavailable.")
+        worker = RunWorker(
+            services.jobs,
+            services.executor,
+            services.worker_registry,
+            settings.execution,
+            max_concurrency=settings.governance.max_concurrent_runs,
+            quota=services.quota,
+        )
+        await worker.run_forever()
+    finally:
+        await services.close()
+    return 0
+
+
+async def _worker_health(settings: Settings) -> int:
+    settings.validate_runtime()
+    redis = Redis.from_url(settings.platform.redis_url, password=settings.redis_password())
+    try:
+        from ai_agent.runs.worker import RedisWorkerRegistry
+
+        healthy = await RedisWorkerRegistry(redis).has_live_workers()
+        _print_json({"workers_available": healthy})
+        return 0 if healthy else 1
+    finally:
+        await redis.aclose()
 
 
 async def _prune_audit(settings: Settings, *, execute: bool) -> int:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, cast
 from uuid import uuid4
 
@@ -22,6 +22,12 @@ from ai_agent.mcp.network_policy import McpNetworkPolicy, McpNetworkPolicyError
 class McpHttpClient(httpx2.AsyncClient):
     """HTTP client that refuses redirects for authenticated MCP traffic."""
 
+    def __init__(self, *args: Any, max_response_bytes: int = 1_000_000, **kwargs: Any) -> None:
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive.")
+        super().__init__(*args, **kwargs)
+        self._max_response_bytes = max_response_bytes
+
     async def send(
         self,
         request: httpx2.Request,
@@ -33,7 +39,7 @@ class McpHttpClient(httpx2.AsyncClient):
         del follow_redirects
         response = await super().send(
             request,
-            stream=stream,
+            stream=True,
             auth=auth,
             follow_redirects=False,
         )
@@ -42,7 +48,53 @@ class McpHttpClient(httpx2.AsyncClient):
             raise McpNetworkPolicyError(
                 "MCP endpoint returned an HTTP redirect, which is not allowed."
             )
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                await response.aclose()
+                raise ProtocolValidationError(
+                    "MCP response has an invalid Content-Length."
+                ) from exc
+            if declared_length < 0:
+                await response.aclose()
+                raise ProtocolValidationError("MCP response has an invalid Content-Length.")
+            if declared_length > self._max_response_bytes:
+                await response.aclose()
+                raise ProtocolValidationError("MCP response exceeds the configured size limit.")
+        if isinstance(response.stream, httpx2.AsyncByteStream):
+            response.stream = LimitedAsyncByteStream(
+                response.stream,
+                max_bytes=self._max_response_bytes,
+            )
+        if not stream:
+            try:
+                await response.aread()
+            except Exception:
+                await response.aclose()
+                raise
         return response
+
+
+class LimitedAsyncByteStream(httpx2.AsyncByteStream):
+    """Stop downloading an MCP response as soon as its byte budget is exhausted."""
+
+    def __init__(self, stream: httpx2.AsyncByteStream, *, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        received = 0
+        async for chunk in self._stream:
+            received += len(chunk)
+            if received > self._max_bytes:
+                await self._stream.aclose()
+                raise ProtocolValidationError("MCP response exceeds the configured size limit.")
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
 
 
 class McpProbeClient:
@@ -54,12 +106,14 @@ class McpProbeClient:
         expected_tools: tuple[str, ...] = (),
         timeout_seconds: float = 10.0,
         network_policy: McpNetworkPolicy | None = None,
+        max_response_bytes: int = 1_000_000,
     ) -> None:
         self._mcp_url = mcp_url
         self._token_provider = token_provider
         self._expected_tools = expected_tools
         self._timeout_seconds = timeout_seconds
         self._network_policy = network_policy or McpNetworkPolicy()
+        self._max_response_bytes = max_response_bytes
 
     async def probe(
         self,
@@ -82,6 +136,7 @@ class McpProbeClient:
                 timeout=self._timeout_seconds,
                 follow_redirects=False,
                 trust_env=False,
+                max_response_bytes=self._max_response_bytes,
             ) as http_client:
                 async with streamable_http_client(
                     self._mcp_url,
@@ -174,6 +229,7 @@ class McpToolClient:
         extra_headers: dict[str, str] | None = None,
         credential_header: str = "Authorization",
         network_policy: McpNetworkPolicy | None = None,
+        max_response_bytes: int = 1_000_000,
     ) -> None:
         self._mcp_url = mcp_url
         self._token_provider = token_provider
@@ -181,6 +237,7 @@ class McpToolClient:
         self._extra_headers = extra_headers or {}
         self._credential_header = credential_header
         self._network_policy = network_policy or McpNetworkPolicy()
+        self._max_response_bytes = max_response_bytes
 
     async def list_tools(self) -> list[ToolDescriptor]:
         async def operation(session: ClientSession) -> list[ToolDescriptor]:
@@ -230,6 +287,7 @@ class McpToolClient:
                 timeout=self._timeout_seconds,
                 follow_redirects=False,
                 trust_env=False,
+                max_response_bytes=self._max_response_bytes,
             ) as http_client:
                 async with streamable_http_client(
                     self._mcp_url,

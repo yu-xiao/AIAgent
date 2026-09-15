@@ -11,7 +11,7 @@ from typing import Any, Required, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
 
-from ai_agent.errors import ModelProviderError
+from ai_agent.errors import ModelProviderError, RunLimitError
 from ai_agent.mcp.models import (
     Citation,
     RunContext,
@@ -39,6 +39,15 @@ class AgentResult:
     tool_invocations: list[ToolInvocationRecord] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class AgentUsageBudget:
+    max_input_tokens: int
+    max_output_tokens: int
+    max_cost_usd: float
+    input_price_per_million_tokens: float
+    output_price_per_million_tokens: float
+
+
 class SingleAgent:
     def __init__(self, provider: ModelProvider) -> None:
         self._provider = provider
@@ -63,6 +72,7 @@ class SingleAgent:
         tool_system_code: str | None = None,
         tool_allowlist: frozenset[str] | None = None,
         personal_only: bool = False,
+        usage_budget: AgentUsageBudget | None = None,
     ) -> AgentResult:
         if gateway is None or context is None or not _supports_tools(self._provider):
             result = await self._graph.ainvoke(
@@ -94,9 +104,16 @@ class SingleAgent:
         total_usage = ModelUsageResult(input_tokens=0, output_tokens=0)
         tool_calls_used = 0
         for _ in range(max_model_rounds):
+            round_output_limit = max_output_tokens
+            if usage_budget is not None:
+                round_output_limit = self._round_output_limit(
+                    working_messages,
+                    total_usage,
+                    usage_budget,
+                )
             answer, usage, tool_calls = await self._stream_model(
                 working_messages,
-                max_output_tokens=max_output_tokens,
+                max_output_tokens=round_output_limit,
                 trace_id=trace_id,
                 on_delta=on_delta,
                 tools=provider_tools,
@@ -105,6 +122,8 @@ class SingleAgent:
                 input_tokens=total_usage.input_tokens + usage.input_tokens,
                 output_tokens=total_usage.output_tokens + usage.output_tokens,
             )
+            if usage_budget is not None:
+                _check_actual_usage(total_usage, usage_budget)
             if not tool_calls:
                 return AgentResult(answer, total_usage, all_citations, invocations)
             if tool_calls_used + len(tool_calls) > max_tool_calls:
@@ -142,6 +161,35 @@ class SingleAgent:
                         )
                     )
         raise ModelProviderError("Agent exceeded the configured model round limit.")
+
+    def _round_output_limit(
+        self,
+        messages: list[ModelMessage],
+        usage: ModelUsageResult,
+        budget: AgentUsageBudget,
+    ) -> int:
+        estimated_input = self._provider.conservative_input_tokens(messages)
+        remaining_input = budget.max_input_tokens - usage.input_tokens
+        if estimated_input > remaining_input:
+            raise RunLimitError("Agent input Token budget is exhausted before the next round.")
+        remaining_output = budget.max_output_tokens - usage.output_tokens
+        if remaining_output <= 0:
+            raise RunLimitError("Agent output Token budget is exhausted before the next round.")
+        spent = _usage_cost(usage, budget)
+        remaining_cost = budget.max_cost_usd - spent
+        input_cost = estimated_input * budget.input_price_per_million_tokens / 1_000_000
+        if input_cost > remaining_cost:
+            raise RunLimitError("Agent cost budget is exhausted before the next round.")
+        if budget.output_price_per_million_tokens <= 0:
+            affordable_output = remaining_output
+        else:
+            affordable_output = int(
+                (remaining_cost - input_cost) * 1_000_000 / budget.output_price_per_million_tokens
+            )
+        output_limit = min(remaining_output, affordable_output)
+        if output_limit <= 0:
+            raise RunLimitError("Agent cost budget cannot fund the next model round.")
+        return output_limit
 
     async def _stream_model(
         self,
@@ -306,3 +354,19 @@ def _digest_arguments(arguments: dict[str, Any]) -> str:
         arguments, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _usage_cost(usage: ModelUsageResult, budget: AgentUsageBudget) -> float:
+    return (
+        usage.input_tokens * budget.input_price_per_million_tokens
+        + usage.output_tokens * budget.output_price_per_million_tokens
+    ) / 1_000_000
+
+
+def _check_actual_usage(usage: ModelUsageResult, budget: AgentUsageBudget) -> None:
+    if usage.input_tokens > budget.max_input_tokens:
+        raise RunLimitError("Agent exceeded the cumulative input Token limit.")
+    if usage.output_tokens > budget.max_output_tokens:
+        raise RunLimitError("Agent exceeded the cumulative output Token limit.")
+    if _usage_cost(usage, budget) > budget.max_cost_usd:
+        raise RunLimitError("Agent exceeded the cumulative cost limit.")

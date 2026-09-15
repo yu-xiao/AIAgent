@@ -12,7 +12,7 @@ from uuid import UUID
 from redis.asyncio import Redis
 
 from ai_agent.audit.service import AuditService
-from ai_agent.config import CredentialVaultBackend, Settings
+from ai_agent.config import CredentialVaultBackend, ExecutionMode, Settings
 from ai_agent.connections.service import ConnectionService
 from ai_agent.conversations.service import ConversationService
 from ai_agent.credentials.vault import (
@@ -38,6 +38,8 @@ from ai_agent.permission_system.service import PermissionSystemService
 from ai_agent.persistence import Database
 from ai_agent.runs.events import RedisRunControl, RedisRunEventBus, RunControl, RunEventBus
 from ai_agent.runs.executor import RunExecutor
+from ai_agent.runs.jobs import RunJobService
+from ai_agent.runs.worker import RedisWorkerRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,8 @@ class AppServices:
     executor: RunExecutor
     provider: ModelProvider
     audit: AuditService
+    jobs: RunJobService | None = None
+    worker_registry: RedisWorkerRegistry | None = None
     quota: RedisRunQuota | None = None
     vault: CredentialVault | None = None
     mcp_registry: McpServerRegistry | None = None
@@ -70,6 +74,10 @@ class AppServices:
             await self.vault.ping()
 
     async def start(self, settings: Settings) -> None:
+        if self.connections is not None:
+            await self.connections.retry_pending_revocations()
+        if settings.execution.mode == ExecutionMode.EXTERNAL_WORKER:
+            return
         queued = await self.conversations.recover_incomplete_runs(
             datetime.now(UTC) - timedelta(seconds=settings.governance.stale_run_after_seconds)
         )
@@ -115,8 +123,15 @@ def build_services(settings: Settings) -> AppServices:
     )
     identities = IdentityService(database.session_factory, audit)
     conversations = ConversationService(
-        database.session_factory, identities, settings.limits, audit
+        database.session_factory,
+        identities,
+        settings.limits,
+        audit,
+        durable_jobs_enabled=settings.execution.mode == ExecutionMode.EXTERNAL_WORKER,
+        job_max_attempts=settings.execution.max_attempts,
     )
+    jobs = RunJobService(database.session_factory, audit)
+    worker_registry = RedisWorkerRegistry(redis)
     events = RedisRunEventBus(redis)
     control = RedisRunControl(redis)
     provider = OpenAICompatibleProvider(settings.model)
@@ -146,6 +161,7 @@ def build_services(settings: Settings) -> AppServices:
         settings.platform,
         default_timeout_seconds=settings.mcp_gateway.default_timeout_seconds,
         signing_algorithms=settings.oidc.signing_algorithms,
+        network_policy=network_policy,
         audit=audit,
     )
     catalog = ToolCatalogService(
@@ -195,6 +211,7 @@ def build_services(settings: Settings) -> AppServices:
         ),
         personal_tools_only=settings.permission_system.enabled,
         quota=quota,
+        jobs=jobs,
         shutdown_grace_seconds=settings.governance.shutdown_grace_seconds,
         max_concurrent_runs=settings.governance.max_concurrent_runs,
     )
@@ -210,6 +227,8 @@ def build_services(settings: Settings) -> AppServices:
         executor=executor,
         provider=provider,
         audit=audit,
+        jobs=jobs,
+        worker_registry=worker_registry,
         quota=quota,
         vault=vault,
         mcp_registry=mcp_registry,

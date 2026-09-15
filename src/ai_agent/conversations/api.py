@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_agent.config import ExecutionMode
 from ai_agent.conversations.service import TERMINAL_RUN_STATUSES
 from ai_agent.identity.dependencies import (
     CurrentIdentity,
@@ -180,12 +181,22 @@ async def create_message_run(
             detail="Agent Runs are disabled by the global switch.",
         )
     services = request.app.state.services
+    external_worker = settings.execution.mode == ExecutionMode.EXTERNAL_WORKER
     if services.quota is not None and not await services.quota.runs_enabled():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent Runs are disabled by the operational switch.",
-        )
-    if not services.executor.accepting:
+    )
+    if external_worker:
+        if (
+            services.worker_registry is None
+            or not await services.worker_registry.has_live_workers()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No healthy Agent Worker is available.",
+            )
+    elif not services.executor.accepting:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent Runs are draining for service shutdown.",
@@ -203,7 +214,8 @@ async def create_message_run(
         )
     quota_lease = None
     if services.quota is not None:
-        quota_lease = await services.quota.acquire(
+        quota_method = services.quota.reserve if external_worker else services.quota.acquire
+        quota_lease = await quota_method(
             organization_id,
             identity.session.user_id,
             str(request.state.trace_id),
@@ -233,41 +245,42 @@ async def create_message_run(
                 "Failed to publish queued Agent Run event",
                 extra={"run_id": str(run.id)},
             )
-        try:
-            accepted = services.executor.submit(run.id, quota_lease)
-        except RuntimeError as exc:
-            await services.executor.reject_submission(
-                run.id,
-                str(run.trace_id),
-                "service_draining",
-                "Run was rejected because the service is draining.",
-                quota_lease,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Agent Runs are draining for service shutdown.",
-            ) from exc
-        except Exception as exc:
-            logger.exception("Failed to submit Agent Run", extra={"run_id": str(run.id)})
-            await services.executor.reject_submission(
-                run.id,
-                str(run.trace_id),
-                "submission_failed",
-                "Run could not be submitted for execution.",
-                quota_lease,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Agent Runs are temporarily unavailable.",
-            ) from exc
-        if not accepted and services.quota is not None and quota_lease is not None:
+        if not external_worker:
             try:
-                await services.quota.rollback(quota_lease)
-            except Exception:
-                logger.exception(
-                    "Failed to roll back duplicate Run quota",
-                    extra={"run_id": str(run.id)},
+                accepted = services.executor.submit(run.id, quota_lease)
+            except RuntimeError as exc:
+                await services.executor.reject_submission(
+                    run.id,
+                    str(run.trace_id),
+                    "service_draining",
+                    "Run was rejected because the service is draining.",
+                    quota_lease,
                 )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Agent Runs are draining for service shutdown.",
+                ) from exc
+            except Exception as exc:
+                logger.exception("Failed to submit Agent Run", extra={"run_id": str(run.id)})
+                await services.executor.reject_submission(
+                    run.id,
+                    str(run.trace_id),
+                    "submission_failed",
+                    "Run could not be submitted for execution.",
+                    quota_lease,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Agent Runs are temporarily unavailable.",
+                ) from exc
+            if not accepted and services.quota is not None and quota_lease is not None:
+                try:
+                    await services.quota.rollback(quota_lease)
+                except Exception:
+                    logger.exception(
+                        "Failed to roll back duplicate Run quota",
+                        extra={"run_id": str(run.id)},
+                    )
     elif services.quota is not None and quota_lease is not None:
         try:
             await services.quota.rollback(quota_lease)
@@ -307,12 +320,42 @@ async def cancel_run(
         identity.session.user_id, organization_id, run_id
     )
     if run.status not in TERMINAL_RUN_STATUSES:
-        await request.app.state.services.control.request_cancel(run.id)
-        await request.app.state.services.events.publish(
-            run.id,
-            "run.cancellation_requested",
-            {"trace_id": str(run.trace_id)},
-        )
+        services = request.app.state.services
+        settings = request.app.state.settings
+        cancelled_while_queued = False
+        if settings.execution.mode == ExecutionMode.EXTERNAL_WORKER and services.jobs is not None:
+            cancelled_while_queued = await services.jobs.cancel_queued(run.id)
+        if cancelled_while_queued:
+            if services.quota is not None:
+                quota_lease = services.quota.reservation_lease(
+                    organization_id,
+                    identity.session.user_id,
+                    str(run.trace_id),
+                    budget_day=run.created_at.date(),
+                )
+                try:
+                    await services.quota.rollback(quota_lease)
+                except Exception:
+                    logger.exception(
+                        "Failed to roll back cancelled durable Run quota",
+                        extra={"run_id": str(run.id)},
+                    )
+            run = await services.conversations.get_run(
+                identity.session.user_id, organization_id, run_id
+            )
+            await services.events.publish(
+                run.id,
+                "run.cancelled",
+                {"trace_id": str(run.trace_id), "error_code": "cancelled"},
+                terminal=True,
+            )
+        else:
+            await services.control.request_cancel(run.id)
+            await services.events.publish(
+                run.id,
+                "run.cancellation_requested",
+                {"trace_id": str(run.trace_id)},
+            )
     return _run_view(run)
 
 

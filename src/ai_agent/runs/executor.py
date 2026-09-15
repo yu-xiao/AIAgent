@@ -7,7 +7,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from ai_agent.agents import SingleAgent
+from ai_agent.agents import AgentUsageBudget, SingleAgent
 from ai_agent.config import ModelSettings, RunLimitSettings
 from ai_agent.conversations.service import ConversationService
 from ai_agent.errors import ModelProviderError, QuotaExceededError, RunLimitError
@@ -24,6 +24,7 @@ from ai_agent.observability.metrics import (
 from ai_agent.observability.tracing import operation_span
 from ai_agent.persistence.models import Message, RunStatus
 from ai_agent.runs.events import RunControl, RunEventBus
+from ai_agent.runs.jobs import JobLease, RunJobService
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class RunExecutor:
         tool_allowlist: frozenset[str] | None = None,
         personal_tools_only: bool = False,
         quota: RedisRunQuota | None = None,
+        jobs: RunJobService | None = None,
         shutdown_grace_seconds: float = 30.0,
         max_concurrent_runs: int = 20,
     ) -> None:
@@ -61,6 +63,7 @@ class RunExecutor:
         self._tool_allowlist = tool_allowlist
         self._personal_tools_only = personal_tools_only
         self._quota = quota
+        self._jobs = jobs
         self._shutdown_grace_seconds = shutdown_grace_seconds
         if max_concurrent_runs < 1:
             raise ValueError("max_concurrent_runs must be positive.")
@@ -72,15 +75,28 @@ class RunExecutor:
     def accepting(self) -> bool:
         return not self._closed
 
+    @property
+    def shutdown_grace_seconds(self) -> float:
+        return self._shutdown_grace_seconds
+
+    async def execute(
+        self,
+        run_id: UUID,
+        quota_lease: RunQuotaLease | None = None,
+        *,
+        job_lease: JobLease | None = None,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("Run executor is closed.")
+        await self._execute_with_capacity(run_id, quota_lease, job_lease)
+
     def submit(self, run_id: UUID, quota_lease: RunQuotaLease | None = None) -> bool:
         if self._closed:
             raise RuntimeError("Run executor is closed.")
         existing = self._tasks.get(run_id)
         if existing is not None and not existing.done():
             return False
-        task = asyncio.create_task(
-            self._execute_with_capacity(run_id, quota_lease), name=f"agent-run-{run_id}"
-        )
+        task = asyncio.create_task(self.execute(run_id, quota_lease), name=f"agent-run-{run_id}")
         self._tasks[run_id] = task
         task.add_done_callback(self._on_task_done)
         return True
@@ -89,9 +105,13 @@ class RunExecutor:
         self,
         run_id: UUID,
         quota_lease: RunQuotaLease | None = None,
+        job_lease: JobLease | None = None,
     ) -> None:
         async with self._capacity:
-            await self._execute(run_id, quota_lease)
+            if job_lease is None:
+                await self._execute(run_id, quota_lease)
+            else:
+                await self._execute(run_id, quota_lease, job_lease)
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         for run_id, tracked in list(self._tasks.items()):
@@ -119,6 +139,7 @@ class RunExecutor:
         self,
         run_id: UUID,
         quota_lease: RunQuotaLease | None = None,
+        job_lease: JobLease | None = None,
     ) -> None:
         try:
             run = await self._conversations.claim_run(run_id)
@@ -131,6 +152,7 @@ class RunExecutor:
             return
         trace_id = str(run.trace_id)
         metered_usage: tuple[int, int, float] | None = None
+        model_started = False
         try:
             if self._quota is not None and quota_lease is None:
                 try:
@@ -148,10 +170,13 @@ class RunExecutor:
                         "quota_recovery_denied",
                         "Run could not be recovered within the current quota.",
                         trace_id,
+                        job_lease=job_lease,
                     )
                     return
             await self._publish_event(run_id, "run.started", {"trace_id": trace_id})
-            if await self._control.is_cancel_requested(run_id):
+            if run.cancellation_requested_at is not None or await self._is_cancel_requested(
+                run_id
+            ):
                 raise RunCancelledError
             stored_messages = await self._conversations.load_run_messages(run)
             messages = self._bounded_messages(stored_messages)
@@ -177,6 +202,18 @@ class RunExecutor:
                             "gen_ai.request.model": self._provider.model_name,
                         },
                     ):
+                        if await self._is_cancel_requested(run_id):
+                            raise RunCancelledError
+                        if job_lease is not None:
+                            if self._jobs is None:
+                                raise RuntimeError(
+                                    "Durable execution requires a Run job service."
+                                )
+                            if not await self._jobs.mark_execution_started(job_lease):
+                                await self._rollback_quota(quota_lease, run_id)
+                                quota_lease = None
+                                return
+                        model_started = True
                         result = await self._agent.run(
                             messages,
                             max_output_tokens=self._limits.max_output_tokens,
@@ -200,7 +237,20 @@ class RunExecutor:
                             tool_system_code=self._tool_system_code,
                             tool_allowlist=self._tool_allowlist,
                             personal_only=self._personal_tools_only,
+                            usage_budget=AgentUsageBudget(
+                                max_input_tokens=self._limits.max_input_tokens,
+                                max_output_tokens=self._limits.max_output_tokens,
+                                max_cost_usd=self._limits.max_cost_usd,
+                                input_price_per_million_tokens=(
+                                    self._model_settings.input_price_per_million_tokens
+                                ),
+                                output_price_per_million_tokens=(
+                                    self._model_settings.output_price_per_million_tokens
+                                ),
+                            ),
                         )
+            if await self._is_cancel_requested(run_id):
+                raise RunCancelledError
             cost = self._actual_cost(
                 result.usage.input_tokens,
                 result.usage.output_tokens,
@@ -247,6 +297,7 @@ class RunExecutor:
                 cost_usd=cost,
                 citations=result.citations,
                 tool_invocations=result.tool_invocations,
+                job_lease=job_lease,
             )
             if not completed:
                 return
@@ -282,12 +333,16 @@ class RunExecutor:
                 terminal=True,
             )
         except RunCancelledError:
+            if not model_started:
+                await self._rollback_quota(quota_lease, run_id)
+                quota_lease = None
             await self._finish_error(
                 run_id,
                 RunStatus.CANCELLED,
                 "cancelled",
                 "Run was cancelled.",
                 trace_id,
+                job_lease=job_lease,
             )
         except TimeoutError:
             await self._finish_error(
@@ -296,8 +351,12 @@ class RunExecutor:
                 "run_timeout",
                 "Run exceeded its time limit.",
                 trace_id,
+                job_lease=job_lease,
             )
         except RunLimitError:
+            if not model_started:
+                await self._rollback_quota(quota_lease, run_id)
+                quota_lease = None
             await self._finish_error(
                 run_id,
                 RunStatus.FAILED,
@@ -305,6 +364,7 @@ class RunExecutor:
                 "Run exceeded a configured hard limit.",
                 trace_id,
                 metered_usage=metered_usage,
+                job_lease=job_lease,
             )
         except ModelProviderError:
             await self._finish_error(
@@ -313,6 +373,7 @@ class RunExecutor:
                 "model_provider_error",
                 "Model provider request failed.",
                 trace_id,
+                job_lease=job_lease,
             )
         except asyncio.CancelledError:
             try:
@@ -321,6 +382,7 @@ class RunExecutor:
                     RunStatus.FAILED,
                     "service_shutdown",
                     "Run stopped because the service shut down.",
+                    job_lease=job_lease,
                 )
             except Exception:
                 logger.exception(
@@ -336,6 +398,7 @@ class RunExecutor:
                 "internal_error",
                 "Run failed unexpectedly.",
                 trace_id,
+                job_lease=job_lease,
             )
         finally:
             await self._abandon_quota(quota_lease, run_id)
@@ -388,6 +451,8 @@ class RunExecutor:
         error_code: str,
         message: str,
         quota_lease: RunQuotaLease | None = None,
+        *,
+        job_lease: JobLease | None = None,
     ) -> None:
         await self._rollback_quota(quota_lease, run_id)
         try:
@@ -396,6 +461,7 @@ class RunExecutor:
                 RunStatus.FAILED,
                 error_code,
                 message,
+                job_lease=job_lease,
             )
         except Exception:
             logger.exception(
@@ -442,6 +508,11 @@ class RunExecutor:
         except Exception:
             logger.exception("Failed to clear Run control state", extra={"run_id": str(run_id)})
 
+    async def _is_cancel_requested(self, run_id: UUID) -> bool:
+        if await self._control.is_cancel_requested(run_id):
+            return True
+        return await self._conversations.is_cancel_requested(run_id)
+
     async def _publish_event(
         self,
         run_id: UUID,
@@ -466,6 +537,7 @@ class RunExecutor:
         message: str,
         trace_id: str,
         metered_usage: tuple[int, int, float] | None = None,
+        job_lease: JobLease | None = None,
     ) -> None:
         try:
             if metered_usage is None:
@@ -474,6 +546,7 @@ class RunExecutor:
                     status,
                     error_code,
                     message,
+                    job_lease=job_lease,
                 )
             else:
                 finished = await self._conversations.finish_run_with_error(
@@ -486,6 +559,7 @@ class RunExecutor:
                     input_tokens=metered_usage[0],
                     output_tokens=metered_usage[1],
                     cost_usd=metered_usage[2],
+                    job_lease=job_lease,
                 )
         except Exception:
             logger.exception(

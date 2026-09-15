@@ -18,6 +18,7 @@ from ai_agent.mcp.client import McpToolClient
 from ai_agent.mcp.models import RunContext, ToolDefinition, ToolDescriptor
 from ai_agent.mcp.network_policy import McpNetworkPolicy
 from ai_agent.mcp.registry import McpServerRegistry
+from ai_agent.mcp.schema import validate_schema
 from ai_agent.persistence.models import ExternalConnection, McpServerDefinition
 
 
@@ -230,12 +231,11 @@ class ToolCatalogService:
         tool_set: str,
         grants: set[str],
     ) -> list[ToolDefinition]:
-        server_allowed = set(server.allowed_tools) or None
-        connection_allowed = set(connection.allowed_tools) or None
-        if server_allowed is not None and connection_allowed is not None:
-            allowed: set[str] | None = server_allowed & connection_allowed
-        else:
-            allowed = server_allowed or connection_allowed
+        server_allowed = set(server.allowed_tools)
+        connection_allowed = set(connection.allowed_tools)
+        if not server_allowed or not connection_allowed:
+            return []
+        allowed = server_allowed & connection_allowed
         selected_names = set(server.tool_sets.get(tool_set, [])) if tool_set else None
         if (
             tool_set
@@ -245,12 +245,21 @@ class ToolCatalogService:
             return []
         result: list[ToolDefinition] = []
         for descriptor in descriptors:
-            if allowed is not None and descriptor.name not in allowed:
+            if descriptor.name not in allowed:
                 continue
             if selected_names is not None and descriptor.name not in selected_names:
                 continue
             if grants and descriptor.name not in grants:
                 continue
+            validate_schema(
+                descriptor.input_schema,
+                label=f"MCP Tool {descriptor.name} input schema",
+            )
+            if descriptor.output_schema:
+                validate_schema(
+                    descriptor.output_schema,
+                    label=f"MCP Tool {descriptor.name} output schema",
+                )
             result.append(
                 ToolDefinition(
                     name=descriptor.name,
@@ -278,7 +287,10 @@ class ToolCatalogService:
                 str(context.user_id),
                 str(server.id),
                 str(connection.id),
+                _scope_digest([connection.credential_reference]),
                 scope_digest,
+                _scope_digest(connection.allowed_tools),
+                _scope_digest(connection.allowed_tool_sets),
                 _scope_digest(sorted(grants)),
                 str(server.config_version),
                 tool_set,
@@ -294,8 +306,14 @@ class ToolCatalogService:
             raise RuntimeError("ToolCatalogService requires a credential vault.")
         return McpToolClient(
             mcp_url=server.mcp_url,
-            token_provider=VaultAccessTokenProvider(self._vault, connection.credential_reference),
+            token_provider=VaultAccessTokenProvider(
+                self._vault,
+                connection.credential_reference,
+                timeout_seconds=server.timeout_seconds,
+                network_policy=self._network_policy,
+            ),
             timeout_seconds=server.timeout_seconds,
+            max_response_bytes=server.response_size_limit,
             credential_header=server.credential_header,
             network_policy=self._network_policy,
             extra_headers={

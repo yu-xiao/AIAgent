@@ -70,3 +70,27 @@ groups:
           severity: warning
         annotations:
           summary: Model cost exceeded 10 USD during one hour
+
+      - alert: AiAgentWorkerUnavailable
+        expr: ai_agent_live_workers == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: No durable Agent Worker is reporting a heartbeat
+
+      - alert: AiAgentRunJobDeadLettered
+        expr: increase(ai_agent_run_jobs_total{outcome="dead_letter"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: One or more durable Run jobs entered the dead letter state
+
+      - alert: AiAgentRunQueueOldestHigh
+        expr: ai_agent_run_queue_oldest_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The oldest queued Agent Run has waited more than 60 seconds

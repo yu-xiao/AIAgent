@@ -14,6 +14,7 @@ from ai_agent.errors import ConflictError, ResourceNotFoundError, RunLimitError
 from ai_agent.identity.service import AGENT_USE, IdentityService
 from ai_agent.mcp.models import Citation as CitationValue
 from ai_agent.mcp.models import ToolInvocationRecord
+from ai_agent.observability.metrics import RUN_JOBS_TOTAL
 from ai_agent.persistence.models import (
     Citation,
     Conversation,
@@ -21,10 +22,14 @@ from ai_agent.persistence.models import (
     MessageRole,
     ModelUsage,
     Run,
+    RunJob,
+    RunJobAttempt,
+    RunJobStatus,
     RunStatus,
     RunStep,
     ToolInvocation,
 )
+from ai_agent.runs.jobs import JobLease
 
 TERMINAL_RUN_STATUSES = {
     RunStatus.COMPLETED,
@@ -41,11 +46,16 @@ class ConversationService:
         identities: IdentityService,
         limits: RunLimitSettings,
         audit: AuditService | None = None,
+        *,
+        durable_jobs_enabled: bool = False,
+        job_max_attempts: int = 3,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
         self._limits = limits
         self._audit = audit or AuditService()
+        self._durable_jobs_enabled = durable_jobs_enabled
+        self._job_max_attempts = job_max_attempts
 
     async def recover_incomplete_runs(self, stale_before: datetime) -> list[Run]:
         """Fail abandoned running work and return durable queued work for resubmission."""
@@ -223,6 +233,15 @@ class ConversationService:
             session.add(run)
             conversation.updated_at = datetime.now(UTC)
             await session.flush()
+            if self._durable_jobs_enabled:
+                session.add(
+                    RunJob(
+                        run_id=run.id,
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        max_attempts=self._job_max_attempts,
+                    )
+                )
             session.add(
                 self._audit.record(
                     organization_id=organization_id,
@@ -326,8 +345,14 @@ class ConversationService:
         cost_usd: float,
         citations: list[CitationValue] | None = None,
         tool_invocations: list[ToolInvocationRecord] | None = None,
+        job_lease: JobLease | None = None,
     ) -> bool:
         async with self._session_factory() as session, session.begin():
+            job = await self._lock_durable_job(session, run_id, job_lease)
+            if job_lease is not None and (
+                job is None or job.execution_started_at is None
+            ):
+                return False
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
             if run is None or run.status != RunStatus.RUNNING:
                 return False
@@ -405,6 +430,14 @@ class ConversationService:
                     },
                 )
             )
+            if job is not None and job_lease is not None:
+                await self._finalize_durable_job(
+                    session,
+                    run,
+                    job,
+                    job_lease,
+                    RunJobStatus.SUCCEEDED,
+                )
             return True
 
     async def list_run_citations(
@@ -469,8 +502,12 @@ class ConversationService:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cost_usd: float | None = None,
+        job_lease: JobLease | None = None,
     ) -> bool:
         async with self._session_factory() as session, session.begin():
+            job = await self._lock_durable_job(session, run_id, job_lease)
+            if job_lease is not None and job is None:
+                return False
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
             if run is None or run.status in TERMINAL_RUN_STATUSES:
                 return False
@@ -519,7 +556,90 @@ class ConversationService:
                     details={"error_code": error_code, **usage_details},
                 )
             )
+            if job is not None and job_lease is not None:
+                job_status = (
+                    RunJobStatus.CANCELLED
+                    if status == RunStatus.CANCELLED
+                    else RunJobStatus.FAILED
+                )
+                await self._finalize_durable_job(
+                    session,
+                    run,
+                    job,
+                    job_lease,
+                    job_status,
+                )
             return True
+
+    async def is_cancel_requested(self, run_id: UUID) -> bool:
+        async with self._session_factory() as session:
+            return bool(
+                await session.scalar(
+                    select(Run.cancellation_requested_at).where(Run.id == run_id)
+                )
+            )
+
+    async def _lock_durable_job(
+        self,
+        session: AsyncSession,
+        run_id: UUID,
+        lease: JobLease | None,
+    ) -> RunJob | None:
+        if lease is None:
+            return None
+        job: RunJob | None = await session.scalar(
+            select(RunJob)
+            .where(
+                RunJob.id == lease.job_id,
+                RunJob.run_id == run_id,
+                RunJob.status == RunJobStatus.LEASED,
+                RunJob.lease_owner == lease.worker_id,
+                RunJob.lease_token == lease.lease_token,
+                RunJob.lease_expires_at >= datetime.now(UTC),
+            )
+            .with_for_update()
+        )
+        return job
+
+    async def _finalize_durable_job(
+        self,
+        session: AsyncSession,
+        run: Run,
+        job: RunJob,
+        lease: JobLease,
+        status: RunJobStatus,
+    ) -> None:
+        job.status = status
+        job.last_error_code = run.error_code
+        job.lease_owner = None
+        job.lease_token = None
+        job.lease_expires_at = None
+        job.heartbeat_at = None
+        attempt = await session.scalar(
+            select(RunJobAttempt)
+            .where(
+                RunJobAttempt.job_id == lease.job_id,
+                RunJobAttempt.attempt_number == lease.attempt_number,
+                RunJobAttempt.lease_token == lease.lease_token,
+            )
+            .with_for_update()
+        )
+        if attempt is not None and attempt.completed_at is None:
+            attempt.completed_at = datetime.now(UTC)
+            attempt.outcome = status.value
+            attempt.error_code = run.error_code
+        session.add(
+            self._audit.record(
+                organization_id=job.organization_id,
+                actor_user_id=None,
+                action=f"run_job.{status.value}",
+                resource_type="run_job",
+                resource_id=str(job.id),
+                trace_id=run.trace_id,
+                details={"attempt": lease.attempt_number},
+            )
+        )
+        RUN_JOBS_TOTAL.labels(outcome=status.value).inc()
 
 
 def _deduplicate_citations(items: list[CitationValue]) -> list[CitationValue]:
