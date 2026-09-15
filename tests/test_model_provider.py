@@ -7,7 +7,7 @@ import respx
 from httpx import Request, Response
 from pydantic import SecretStr
 
-from ai_agent.config import ModelSettings
+from ai_agent.config import ModelSettings, ReasoningEffort
 from ai_agent.errors import ModelProviderError
 from ai_agent.models import ModelMessage
 from ai_agent.models.openai_compatible import OpenAICompatibleProvider
@@ -21,6 +21,7 @@ async def test_openai_compatible_stream_and_usage_contract() -> None:
         payload = json.loads(request.content)
         assert payload["model"] == "configured-model"
         assert payload["stream_options"] == {"include_usage": True}
+        assert "reasoning_effort" not in payload
         return Response(
             200,
             text=(
@@ -45,6 +46,36 @@ async def test_openai_compatible_stream_and_usage_contract() -> None:
     assert events[-1].usage is not None
     assert events[-1].usage.input_tokens == 7
     assert events[-1].usage.output_tokens == 2
+
+
+@respx.mock
+async def test_configured_reasoning_effort_is_forwarded() -> None:
+    def response(request: Request) -> Response:
+        payload = json.loads(request.content)
+        assert payload["reasoning_effort"] == "none"
+        return Response(
+            200,
+            text=(
+                'data: {"choices":[{"delta":{"content":"Hello"}}]}'
+                '\n\ndata: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2}}'
+                "\n\ndata: [DONE]\n\n"
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    respx.post("https://model.example.test/v1/chat/completions").mock(side_effect=response)
+    provider = _provider(reasoning_effort=ReasoningEffort.NONE)
+
+    events = [
+        event
+        async for event in provider.stream(
+            [ModelMessage(role="user", content="Hi")],
+            max_output_tokens=100,
+            trace_id="trace-reasoning",
+        )
+    ]
+
+    assert events[-1].usage is not None
 
 
 @respx.mock
@@ -105,12 +136,13 @@ async def test_openai_compatible_stream_parses_tool_calls() -> None:
     assert calls[0].arguments == {"limit": 10}
 
 
-def _provider() -> OpenAICompatibleProvider:
+def _provider(*, reasoning_effort: ReasoningEffort | None = None) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(
         ModelSettings(
             enabled=True,
             base_url="https://model.example.test/v1",
             model="configured-model",
+            reasoning_effort=reasoning_effort,
             api_key=SecretStr("model-secret"),
         )
     )

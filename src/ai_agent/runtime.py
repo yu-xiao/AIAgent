@@ -24,6 +24,7 @@ from ai_agent.credentials.vault import (
 from ai_agent.evaluations.executor import EvaluationExecutor
 from ai_agent.evaluations.service import EvaluationService
 from ai_agent.governance.quota import RedisRunQuota
+from ai_agent.identity.local import LocalAuthService
 from ai_agent.identity.oidc import OidcLoginService
 from ai_agent.identity.service import IdentityService
 from ai_agent.identity.sessions import RedisSessionStore, SessionStore
@@ -60,6 +61,7 @@ class AppServices:
     executor: RunExecutor
     provider: ModelProvider
     audit: AuditService
+    local_auth: LocalAuthService | None = None
     jobs: RunJobService | None = None
     worker_registry: RedisWorkerRegistry | None = None
     quota: RedisRunQuota | None = None
@@ -142,6 +144,9 @@ def build_services(settings: Settings) -> AppServices:
         key_id=settings.governance.audit_integrity_key_id,
     )
     identities = IdentityService(database.session_factory, audit)
+    local_auth = (
+        LocalAuthService(database, identities, audit) if settings.local_auth.enabled else None
+    )
     evaluations = EvaluationService(
         database.session_factory,
         identities,
@@ -276,6 +281,7 @@ def build_services(settings: Settings) -> AppServices:
         max_concurrent_runs=settings.governance.max_concurrent_runs,
     )
     return AppServices(
+        local_auth=local_auth,
         database=database,
         redis=redis,
         sessions=sessions,

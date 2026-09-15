@@ -5,14 +5,16 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ai_agent.agents.api import router as agent_router
@@ -37,6 +39,7 @@ from ai_agent.errors import (
 )
 from ai_agent.evaluations.api import router as evaluation_router
 from ai_agent.identity.api import router as identity_router
+from ai_agent.identity.local_api import router as local_auth_router
 from ai_agent.mcp.api import router as mcp_router
 from ai_agent.observability.metrics import HTTP_DURATION, HTTP_IN_PROGRESS, HTTP_REQUESTS
 from ai_agent.observability.tracing import configure_tracing
@@ -134,6 +137,7 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     app.state.settings = runtime_settings
     app.state.services = services
     app.include_router(identity_router)
+    app.include_router(local_auth_router)
     app.include_router(agent_router)
     app.include_router(evaluation_router)
     app.include_router(conversation_router)
@@ -186,6 +190,13 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+            debug_document = request.url.path in {"/docs", "/redoc", "/openapi.json"}
+            if runtime_settings.environment == Environment.PRODUCTION or not debug_document:
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; "
+                    "form-action 'self'; img-src 'self' data:; font-src 'self'; "
+                    "style-src 'self'; script-src 'self'; connect-src 'self'"
+                )
             if runtime_settings.environment == Environment.PRODUCTION:
                 response.headers["Strict-Transport-Security"] = "max-age=31536000"
             return response
@@ -392,6 +403,17 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
             },
             "audit_retention_days": governance.audit_retention_days,
         }
+
+    web_dist = Path(runtime_settings.platform.web_dist_path).expanduser().resolve()
+    web_index = web_dist / "index.html"
+    web_assets = web_dist / "assets"
+    if web_index.is_file():
+        if web_assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=web_assets), name="web-assets")
+
+        @app.get("/", include_in_schema=False)
+        async def web_app() -> FileResponse:
+            return FileResponse(web_index, headers={"Cache-Control": "no-cache"})
 
     return app
 

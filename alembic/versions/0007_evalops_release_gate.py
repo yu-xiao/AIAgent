@@ -31,6 +31,9 @@ def upgrade() -> None:
                 "INSERT INTO permissions (code, description) "
                 "SELECT :code, :description "
                 "WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE code = :code)"
+            ).bindparams(
+                sa.bindparam("code", type_=sa.String(length=100)),
+                sa.bindparam("description", type_=sa.String(length=500)),
             ),
             {"code": code, "description": description},
         )
@@ -43,6 +46,8 @@ def upgrade() -> None:
                 "SELECT 1 FROM role_permissions existing "
                 "WHERE existing.role_id = roles.id "
                 "AND existing.permission_code = :permission_code)"
+            ).bindparams(
+                sa.bindparam("permission_code", type_=sa.String(length=100)),
             ),
             {"permission_code": code},
         )
@@ -59,9 +64,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("organization_id", "code", name="uq_eval_datasets_org_code"),
     )
@@ -84,12 +87,8 @@ def upgrade() -> None:
         sa.Column("updated_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["dataset_id"], ["evaluation_datasets.id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["dataset_id"], ["evaluation_datasets.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["updated_by"], ["users.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("dataset_id"),
     )
@@ -108,17 +107,11 @@ def upgrade() -> None:
         sa.Column("cases_digest", sa.String(length=64), nullable=False),
         sa.Column("created_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["dataset_id"], ["evaluation_datasets.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["dataset_id"], ["evaluation_datasets.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "dataset_id", "version_number", name="uq_eval_dataset_versions_number"
-        ),
+        sa.UniqueConstraint("dataset_id", "version_number", name="uq_eval_dataset_versions_number"),
     )
     op.create_index(
         "ix_evaluation_dataset_versions_dataset_id",
@@ -150,22 +143,16 @@ def upgrade() -> None:
         sa.Column("updated_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["dataset_version_id"],
             ["evaluation_dataset_versions.id"],
             ondelete="RESTRICT",
         ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["updated_by"], ["users.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "agent_id", "environment", name="uq_agent_eval_policies_environment"
-        ),
+        sa.UniqueConstraint("agent_id", "environment", name="uq_agent_eval_policies_environment"),
     )
     op.create_index(
         "ix_agent_evaluation_policies_agent_id",
@@ -209,20 +196,14 @@ def upgrade() -> None:
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["agent_version_id"], ["agent_versions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["agent_version_id"], ["agent_versions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["dataset_version_id"],
             ["evaluation_dataset_versions.id"],
             ondelete="RESTRICT",
         ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
             ["policy_id"], ["agent_evaluation_policies.id"], ondelete="RESTRICT"
         ),
@@ -265,16 +246,10 @@ def upgrade() -> None:
         sa.Column("output_tokens", sa.Integer(), nullable=False),
         sa.Column("duration_ms", sa.Float(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["evaluation_run_id"], ["evaluation_runs.id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["evaluation_run_id"], ["evaluation_runs.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "evaluation_run_id", "case_key", name="uq_eval_results_run_case"
-        ),
+        sa.UniqueConstraint("evaluation_run_id", "case_key", name="uq_eval_results_run_case"),
     )
     op.create_index(
         "ix_evaluation_case_results_evaluation_run_id",
@@ -294,9 +269,7 @@ def upgrade() -> None:
     with op.batch_alter_table("agent_releases") as batch_op:
         batch_op.add_column(sa.Column("evaluation_run_id", sa.Uuid(), nullable=True))
         batch_op.add_column(sa.Column("gate_decision", sa.String(length=30), nullable=True))
-        batch_op.add_column(
-            sa.Column("gate_policy_digest", sa.String(length=64), nullable=True)
-        )
+        batch_op.add_column(sa.Column("gate_policy_digest", sa.String(length=64), nullable=True))
         batch_op.create_foreign_key(
             "fk_agent_releases_evaluation_run_id",
             "evaluation_runs",
@@ -308,9 +281,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     with op.batch_alter_table("agent_releases") as batch_op:
-        batch_op.drop_constraint(
-            "fk_agent_releases_evaluation_run_id", type_="foreignkey"
-        )
+        batch_op.drop_constraint("fk_agent_releases_evaluation_run_id", type_="foreignkey")
         batch_op.drop_column("gate_policy_digest")
         batch_op.drop_column("gate_decision")
         batch_op.drop_column("evaluation_run_id")
@@ -329,9 +300,7 @@ def downgrade() -> None:
     op.drop_index("ix_evaluation_runs_agent_version_id", table_name="evaluation_runs")
     op.drop_index("ix_evaluation_runs_agent_id", table_name="evaluation_runs")
     op.drop_table("evaluation_runs")
-    op.drop_index(
-        "ix_agent_eval_policies_org_environment", table_name="agent_evaluation_policies"
-    )
+    op.drop_index("ix_agent_eval_policies_org_environment", table_name="agent_evaluation_policies")
     op.drop_index(
         "ix_agent_evaluation_policies_organization_id",
         table_name="agent_evaluation_policies",
@@ -360,9 +329,7 @@ def downgrade() -> None:
     )
     op.drop_table("evaluation_dataset_drafts")
     op.drop_index("ix_eval_datasets_org_status", table_name="evaluation_datasets")
-    op.drop_index(
-        "ix_evaluation_datasets_organization_id", table_name="evaluation_datasets"
-    )
+    op.drop_index("ix_evaluation_datasets_organization_id", table_name="evaluation_datasets")
     op.drop_table("evaluation_datasets")
     bind = op.get_bind()
     bind.execute(

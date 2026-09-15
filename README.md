@@ -1,6 +1,6 @@
 # Enterprise AI Agent
 
-这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0-P3 及跳过 P4 后的 P5 生产治理：独立 OIDC 会话、组织 RBAC、版本化 Agent 草稿/发布/回滚、EvalOps 数据集与开发环境发布门禁、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、持久 Run Job 与独立 Worker、Run/SSE/取消、硬限制、追加式审计、可信 MCP Server 注册、PermissionSystem 个人/组织连接、隔离 Tool Catalog、HashiCorp Vault、分布式配额、跨实例 MCP 限流/熔断、指标、Trace、审计留存和蓝绿发布制品。金蝶、MES、BI 暂未接入。
+这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0-P3 及跳过 P4 后的 P5 生产治理：独立 OIDC 会话、开发/内部测试用本地账号、组织 RBAC、版本化 Agent 草稿/发布/回滚、EvalOps 数据集与开发环境发布门禁、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、持久 Run Job 与独立 Worker、Run/SSE/取消、硬限制、追加式审计、可信 MCP Server 注册、PermissionSystem 个人/组织连接、隔离 Tool Catalog、HashiCorp Vault、分布式配额、跨实例 MCP 限流/熔断、指标、Trace、审计留存和蓝绿发布制品。金蝶、MES、BI 暂未接入。
 
 P1 的模型供应商、模型名、Base URL 和 API Key 只从本地环境变量读取，不写入仓库。P2 的 Token、Refresh Token 和 Client Secret 只进入 CredentialVault，不保存到数据库或普通日志。
 
@@ -8,12 +8,29 @@ P1 的模型供应商、模型名、Base URL 和 API Key 只从本地环境变�
 
 ```powershell
 .\scripts\bootstrap.ps1
+Set-Location web
+npm install
+npm run build
+Set-Location ..
 Copy-Item .env.example .env
 uv run --no-sync ai-agent check-config
 uv run --no-sync ai-agent serve
 ```
 
-启用 P1 前，先启动 PostgreSQL/Redis（本机需要 Docker），执行迁移并在 `.env` 中填写 OIDC 和模型配置：
+构建后的 Web 工作台由 FastAPI 同源托管。平台配置完成后访问
+`http://127.0.0.1:8000/`，登录后即可创建对话、查看流式回答、停止运行和恢复历史会话。
+
+前端日常开发可使用 Vite 热更新：
+
+```powershell
+$env:AI_AGENT_PLATFORM__POST_LOGIN_REDIRECT_URI = "http://localhost:5173/"
+Set-Location web
+npm run dev
+```
+
+Vite 会将 `/api` 和 `/health` 请求代理到本机 `127.0.0.1:8000`，浏览器不保存 OIDC Token 或密码。
+
+启用 P1 前，先启动 PostgreSQL/Redis（本机需要 Docker），执行迁移并在 `.env` 中填写认证和模型配置：
 
 ```powershell
 $env:AI_AGENT_POSTGRES_PASSWORD = "change-me"
@@ -22,12 +39,21 @@ uv run --no-sync alembic upgrade head
 uv run --no-sync ai-agent check-config
 ```
 
-然后将 `AI_AGENT_PLATFORM__ENABLED` 和 `AI_AGENT_MODEL__ENABLED` 设为 `true`，补充 `AI_AGENT_MODEL__BASE_URL`、`AI_AGENT_MODEL__MODEL`、`AI_AGENT_MODEL__API_KEY` 及正的输入/输出单价。生产环境必须使用 HTTPS OIDC、模型和数据库/Redis 安全连接。
+为了先完成本地试用，可以在开发环境启用注册登录：
+
+```text
+AI_AGENT_LOCAL_AUTH__ENABLED=true
+AI_AGENT_LOCAL_AUTH__REGISTRATION_ENABLED=true
+AI_AGENT_OIDC__ENABLED=false
+```
+
+然后将 `AI_AGENT_PLATFORM__ENABLED` 和 `AI_AGENT_MODEL__ENABLED` 设为 `true`，补充 `AI_AGENT_MODEL__BASE_URL`、`AI_AGENT_MODEL__MODEL`、`AI_AGENT_MODEL__API_KEY` 及正的输入/输出单价。访问工作台后使用邮箱、显示名称和至少 12 位密码注册，注册成功会自动创建个人工作区并登录。本地账号只面向开发和内部测试，生产环境会拒绝启用，生产仍必须配置 HTTPS OIDC 及数据库/Redis 安全连接。
 
 `bootstrap.ps1` 优先执行标准 `uv sync`。若当前 Windows 环境的 uv 出现 PEP 517 临时结果文件异常，脚本会保留 uv 的锁定依赖，并使用同一虚拟环境完成 editable 安装。
 
 服务启动后可访问：
 
+- `GET http://127.0.0.1:8000/`（Web 工作台）
 - `GET http://127.0.0.1:8000/health/live`
 - `GET http://127.0.0.1:8000/health/ready`
 - `GET http://127.0.0.1:8000/api/v1/p0/status`

@@ -2,7 +2,7 @@
 
 ## 范围
 
-P1 是模块化单体后端，提供独立 OIDC 登录会话、组织与基础 RBAC、会话/消息/Run 持久化、LangGraph 单智能体、OpenAI-compatible 流式模型适配、SSE 事件、取消、指标和追加式审计。
+P1 是模块化单体后端，提供独立 OIDC 登录会话、开发/内部测试用本地注册登录、组织与基础 RBAC、会话/消息/Run 持久化、LangGraph 单智能体、OpenAI-compatible 流式模型适配、SSE 事件、取消、指标和追加式审计。
 
 P1 不包含外部账号连接中心、MCP Gateway、业务 Tool、前端和业务写操作。模型配置只来自环境变量；示例文件中的值为空，不应将真实 Key 写入版本库。
 
@@ -23,10 +23,19 @@ AI_AGENT_PLATFORM__ENABLED=true
 AI_AGENT_MODEL__ENABLED=true
 AI_AGENT_MODEL__BASE_URL=https://your-compatible-provider.example/v1
 AI_AGENT_MODEL__MODEL=<provider-model-name>
+AI_AGENT_MODEL__REASONING_EFFORT=<optional-provider-supported-value>
 AI_AGENT_MODEL__API_KEY=<local-only-secret>
 AI_AGENT_MODEL__INPUT_PRICE_PER_MILLION_TOKENS=<positive-number>
 AI_AGENT_MODEL__OUTPUT_PRICE_PER_MILLION_TOKENS=<positive-number>
 AI_AGENT_OIDC__ENABLED=true
+```
+
+OIDC 测试服务尚未准备好时，开发环境可以改用本地注册登录：
+
+```text
+AI_AGENT_OIDC__ENABLED=false
+AI_AGENT_LOCAL_AUTH__ENABLED=true
+AI_AGENT_LOCAL_AUTH__REGISTRATION_ENABLED=true
 ```
 
 启动服务：
@@ -36,12 +45,14 @@ uv run --no-sync ai-agent check-config
 uv run --no-sync ai-agent serve
 ```
 
-首次登录使用 `GET /api/v1/auth/login`。OIDC 回调完成后服务端创建不透明 Session Cookie；`GET /api/v1/me` 返回 CSRF Token 和当前用户可见组织。创建会话、发送消息、取消 Run 等写请求需要 `X-Organization-Id` 和 `X-CSRF-Token`。
+OIDC 首次登录使用 `GET /api/v1/auth/login`；本地账号通过工作台注册或登录。两种方式最终都创建同一类不透明 HttpOnly Session Cookie；`GET /api/v1/me` 返回 CSRF Token 和当前用户可见组织。创建会话、发送消息、取消 Run 等写请求需要 `X-Organization-Id` 和 `X-CSRF-Token`。本地账号只允许开发和内部测试，生产环境仍要求 OIDC。
 
 ## API 验收
 
 - `GET /health/live`：进程存活。
 - `GET /health/ready`：配置、PostgreSQL 和 Redis 可用。
+- `GET /api/v1/auth/options`：返回工作台可展示的登录方式，不返回密钥。
+- `POST /api/v1/auth/register`、`POST /api/v1/auth/local/login`：本地注册与登录。
 - `GET /api/v1/p1/status`：P1 功能开关和能力状态，不返回密钥。
 - `POST /api/v1/organizations`：创建组织，创建者自动获得组织管理员角色。
 - `GET /api/v1/conversations`、`POST /api/v1/conversations`：用户自己的会话。

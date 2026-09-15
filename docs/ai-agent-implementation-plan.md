@@ -10,7 +10,7 @@
 | 首期形态 | 独立认证体系、单智能体、只读 MCP Tool |
 | 当前目标 | 先交付可供真实用户试用的 Web 工作台和 PermissionSystem 查询闭环 |
 | 演进方向 | 可用产品闭环稳定后，再迭代多业务系统和企业治理能力 |
-| 当前实施状态 | 后端 P0-P3、P5 基础已完成；当前转入 U1-U6 可用性优先阶段 |
+| 当前实施状态 | U1/U2 工作台已实现；优先用本地注册登录完成可用闭环，OIDC 联调后置 |
 
 ## 2. 项目定位
 
@@ -162,7 +162,7 @@ flowchart TB
 | Agent 编排 | LangGraph | 首期单 Agent，后续可拆分 Subgraph |
 | MCP | 官方 MCP Python SDK | Streamable HTTP Client |
 | 模型接入 | 自定义 `ModelProvider` 接口 | 首期接入一个模型供应商，避免业务层绑定 |
-| Agent 身份 | 独立 OIDC | 默认建议专用 Keycloak Realm，可替换企业 IdP |
+| Agent 身份 | 本地账号（试用）+ 独立 OIDC（生产） | 先用本地注册打通试用，生产仍接专用 Keycloak Realm 或企业 IdP |
 | ORM | SQLAlchemy 2 | 异步持久化和清晰的数据访问边界 |
 | 数据迁移 | Alembic | 版本化数据库变更 |
 | 主数据库 | PostgreSQL | 用户、连接、会话、运行和审计数据 |

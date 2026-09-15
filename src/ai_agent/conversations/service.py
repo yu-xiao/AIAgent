@@ -174,6 +174,39 @@ class ConversationService:
             )
             return conversation, messages
 
+    async def list_conversation_runs(
+        self,
+        user_id: UUID,
+        organization_id: UUID,
+        conversation_id: UUID,
+        *,
+        limit: int,
+    ) -> list[Run]:
+        """Return recent runs for a user-owned conversation, newest first."""
+
+        await self._identities.access(user_id, organization_id, AGENT_USE)
+        async with self._session_factory() as session:
+            conversation_id_value = await session.scalar(
+                select(Conversation.id).where(
+                    Conversation.id == conversation_id,
+                    Conversation.organization_id == organization_id,
+                    Conversation.user_id == user_id,
+                )
+            )
+            if conversation_id_value is None:
+                raise ResourceNotFoundError("Conversation not found.")
+            result = await session.scalars(
+                select(Run)
+                .where(
+                    Run.conversation_id == conversation_id,
+                    Run.organization_id == organization_id,
+                    Run.user_id == user_id,
+                )
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(limit)
+            )
+            return list(result)
+
     async def create_run(
         self,
         user_id: UUID,
@@ -399,9 +432,7 @@ class ConversationService:
     ) -> bool:
         async with self._session_factory() as session, session.begin():
             job = await self._lock_durable_job(session, run_id, job_lease)
-            if job_lease is not None and (
-                job is None or job.execution_started_at is None
-            ):
+            if job_lease is not None and (job is None or job.execution_started_at is None):
                 return False
             run = await session.scalar(select(Run).where(Run.id == run_id).with_for_update())
             if run is None or run.status != RunStatus.RUNNING:
@@ -608,9 +639,7 @@ class ConversationService:
             )
             if job is not None and job_lease is not None:
                 job_status = (
-                    RunJobStatus.CANCELLED
-                    if status == RunStatus.CANCELLED
-                    else RunJobStatus.FAILED
+                    RunJobStatus.CANCELLED if status == RunStatus.CANCELLED else RunJobStatus.FAILED
                 )
                 await self._finalize_durable_job(
                     session,
@@ -624,9 +653,7 @@ class ConversationService:
     async def is_cancel_requested(self, run_id: UUID) -> bool:
         async with self._session_factory() as session:
             return bool(
-                await session.scalar(
-                    select(Run.cancellation_requested_at).where(Run.id == run_id)
-                )
+                await session.scalar(select(Run.cancellation_requested_at).where(Run.id == run_id))
             )
 
     async def _lock_durable_job(

@@ -7,7 +7,9 @@
 __pycache__
 *.pyc
 .env*
+.secrets
 build
 dist
 tests
 docs
+node_modules

@@ -32,6 +32,9 @@ def upgrade() -> None:
                 "INSERT INTO permissions (code, description) "
                 "SELECT :code, :description "
                 "WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE code = :code)"
+            ).bindparams(
+                sa.bindparam("code", type_=sa.String(length=100)),
+                sa.bindparam("description", type_=sa.String(length=500)),
             ),
             {"code": code, "description": description},
         )
@@ -44,6 +47,8 @@ def upgrade() -> None:
                 "SELECT 1 FROM role_permissions existing "
                 "WHERE existing.role_id = roles.id "
                 "AND existing.permission_code = :permission_code)"
+            ).bindparams(
+                sa.bindparam("permission_code", type_=sa.String(length=100)),
             ),
             {"permission_code": code},
         )
@@ -60,13 +65,9 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "organization_id", "code", name="uq_agent_definitions_org_code"
-        ),
+        sa.UniqueConstraint("organization_id", "code", name="uq_agent_definitions_org_code"),
     )
     op.create_index(
         "ix_agent_definitions_organization_id",
@@ -95,18 +96,12 @@ def upgrade() -> None:
         sa.Column("updated_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["updated_by"], ["users.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("agent_id"),
     )
-    op.create_index(
-        "ix_agent_drafts_organization_id", "agent_drafts", ["organization_id"]
-    )
+    op.create_index("ix_agent_drafts_organization_id", "agent_drafts", ["organization_id"])
     op.create_table(
         "agent_versions",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -117,20 +112,14 @@ def upgrade() -> None:
         sa.Column("config_digest", sa.String(length=64), nullable=False),
         sa.Column("created_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["created_by"], ["users.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("agent_id", "version_number", name="uq_agent_versions_number"),
     )
     op.create_index("ix_agent_versions_agent_id", "agent_versions", ["agent_id"])
-    op.create_index(
-        "ix_agent_versions_organization_id", "agent_versions", ["organization_id"]
-    )
+    op.create_index("ix_agent_versions_organization_id", "agent_versions", ["organization_id"])
     op.create_index(
         "ix_agent_versions_org_agent",
         "agent_versions",
@@ -147,18 +136,12 @@ def upgrade() -> None:
         sa.Column("deployed_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["deployed_by"], ["users.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["version_id"], ["agent_versions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "agent_id", "environment", name="uq_agent_deployments_environment"
-        ),
+        sa.UniqueConstraint("agent_id", "environment", name="uq_agent_deployments_environment"),
     )
     op.create_index("ix_agent_deployments_agent_id", "agent_deployments", ["agent_id"])
     op.create_index(
@@ -184,12 +167,8 @@ def upgrade() -> None:
         sa.Column("idempotency_key", sa.String(length=200), nullable=True),
         sa.Column("requested_by", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["organization_id"], ["organizations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], ["agent_definitions.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
             ["previous_version_id"], ["agent_versions.id"], ondelete="RESTRICT"
         ),
@@ -203,9 +182,7 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_agent_releases_agent_id", "agent_releases", ["agent_id"])
-    op.create_index(
-        "ix_agent_releases_organization_id", "agent_releases", ["organization_id"]
-    )
+    op.create_index("ix_agent_releases_organization_id", "agent_releases", ["organization_id"])
     op.create_index(
         "ix_agent_releases_org_agent",
         "agent_releases",
@@ -214,9 +191,7 @@ def upgrade() -> None:
     with op.batch_alter_table("runs") as batch_op:
         batch_op.add_column(sa.Column("agent_id", sa.Uuid(), nullable=True))
         batch_op.add_column(sa.Column("agent_version_id", sa.Uuid(), nullable=True))
-        batch_op.add_column(
-            sa.Column("agent_config_digest", sa.String(length=64), nullable=True)
-        )
+        batch_op.add_column(sa.Column("agent_config_digest", sa.String(length=64), nullable=True))
         batch_op.create_foreign_key(
             "fk_runs_agent_id",
             "agent_definitions",
@@ -258,9 +233,7 @@ def downgrade() -> None:
     op.drop_table("agent_versions")
     op.drop_index("ix_agent_drafts_organization_id", table_name="agent_drafts")
     op.drop_table("agent_drafts")
-    op.drop_index(
-        "uq_agent_definitions_one_default_org", table_name="agent_definitions"
-    )
+    op.drop_index("uq_agent_definitions_one_default_org", table_name="agent_definitions")
     op.drop_index("ix_agent_definitions_org_status", table_name="agent_definitions")
     op.drop_index("ix_agent_definitions_organization_id", table_name="agent_definitions")
     op.drop_table("agent_definitions")

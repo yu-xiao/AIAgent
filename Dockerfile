@@ -1,3 +1,11 @@
+FROM node:22.15.0-alpine AS web-builder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:0.9.21@sha256:15f68a476b768083505fe1dbfcc998344d0135f0ca1b8465c4760b323904f05a AS uv
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS builder
 
@@ -29,6 +37,7 @@ WORKDIR /app
 COPY --from=builder --chown=aiagent:aiagent /app/.venv /app/.venv
 COPY --chown=aiagent:aiagent alembic ./alembic
 COPY --chown=aiagent:aiagent alembic.ini ./alembic.ini
+COPY --from=web-builder --chown=aiagent:aiagent /web/dist ./web/dist
 
 USER aiagent
 EXPOSE 8000

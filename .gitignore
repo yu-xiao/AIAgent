@@ -1,5 +1,6 @@
 .env
 .env.production
+.secrets/
 .venv/
 .uv-cache/
 .pytest_cache/
@@ -12,3 +13,4 @@ __pycache__/
 htmlcov/
 dist/
 build/
+node_modules/

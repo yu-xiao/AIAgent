@@ -147,61 +147,66 @@ class IdentityService:
 
     async def create_organization(self, user_id: UUID, name: str) -> Organization:
         async with self._session_factory() as session, session.begin():
-            organization = Organization(name=name)
-            session.add(organization)
-            await session.flush()
-            member = OrganizationMember(organization_id=organization.id, user_id=user_id)
-            session.add(member)
-            await session.flush()
+            return await self.create_organization_in_session(session, user_id, name)
 
-            for code, description in PERMISSION_DEFINITIONS.items():
-                if await session.get(Permission, code) is None:
-                    session.add(Permission(code=code, description=description))
-            await session.flush()
+    async def create_organization_in_session(
+        self, session: AsyncSession, user_id: UUID, name: str
+    ) -> Organization:
+        organization = Organization(name=name)
+        session.add(organization)
+        await session.flush()
+        member = OrganizationMember(organization_id=organization.id, user_id=user_id)
+        session.add(member)
+        await session.flush()
 
-            admin = Role(
-                organization_id=organization.id,
-                code=ADMIN_ROLE,
-                display_name="Organization administrator",
-            )
-            standard = Role(
-                organization_id=organization.id,
-                code=MEMBER_ROLE,
-                display_name="Member",
-            )
-            session.add_all([admin, standard])
-            await session.flush()
-            session.add_all(
-                [
-                    RolePermission(role_id=admin.id, permission_code=code)
-                    for code in PERMISSION_DEFINITIONS
-                ]
-                + [
-                    RolePermission(role_id=standard.id, permission_code=code)
-                    for code in (
-                        AGENT_USE,
-                        CONNECTION_PERSONAL_CREATE,
-                        CONNECTION_PERSONAL_DISCONNECT,
-                        MCP_SERVER_VIEW,
-                        TOOL_PERMISSION_USE,
-                        TOOL_ERP_USE,
-                        TOOL_MES_USE,
-                        TOOL_BI_USE,
-                    )
-                ]
-                + [MemberRole(member_id=member.id, role_id=admin.id)]
-            )
-            session.add(
-                self._audit.record(
-                    organization_id=organization.id,
-                    actor_user_id=user_id,
-                    action="organization.created",
-                    resource_type="organization",
-                    resource_id=str(organization.id),
-                    details={"name": name},
+        for code, description in PERMISSION_DEFINITIONS.items():
+            if await session.get(Permission, code) is None:
+                session.add(Permission(code=code, description=description))
+        await session.flush()
+
+        admin = Role(
+            organization_id=organization.id,
+            code=ADMIN_ROLE,
+            display_name="Organization administrator",
+        )
+        standard = Role(
+            organization_id=organization.id,
+            code=MEMBER_ROLE,
+            display_name="Member",
+        )
+        session.add_all([admin, standard])
+        await session.flush()
+        session.add_all(
+            [
+                RolePermission(role_id=admin.id, permission_code=code)
+                for code in PERMISSION_DEFINITIONS
+            ]
+            + [
+                RolePermission(role_id=standard.id, permission_code=code)
+                for code in (
+                    AGENT_USE,
+                    CONNECTION_PERSONAL_CREATE,
+                    CONNECTION_PERSONAL_DISCONNECT,
+                    MCP_SERVER_VIEW,
+                    TOOL_PERMISSION_USE,
+                    TOOL_ERP_USE,
+                    TOOL_MES_USE,
+                    TOOL_BI_USE,
                 )
+            ]
+            + [MemberRole(member_id=member.id, role_id=admin.id)]
+        )
+        session.add(
+            self._audit.record(
+                organization_id=organization.id,
+                actor_user_id=user_id,
+                action="organization.created",
+                resource_type="organization",
+                resource_id=str(organization.id),
+                details={"name": name},
             )
-            return organization
+        )
+        return organization
 
     async def list_organizations(self, user_id: UUID) -> list[Organization]:
         async with self._session_factory() as session:

@@ -47,6 +47,22 @@ class EvaluationGateMode(StrEnum):
     REQUIRED = "required"
 
 
+class ReasoningEffort(StrEnum):
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+    ULTRA = "ultra"
+
+
+class LocalAuthSettings(BaseModel):
+    enabled: bool = False
+    registration_enabled: bool = False
+
+
 class OidcSettings(BaseModel):
     enabled: bool = False
     issuer: str = "http://localhost:8081/realms/ai-agent"
@@ -68,7 +84,8 @@ class PlatformSettings(BaseModel):
     session_ttl_seconds: int = Field(default=28_800, ge=300, le=604_800)
     oauth_transaction_ttl_seconds: int = Field(default=600, ge=60, le=1_800)
     session_cookie_name: str = "ai_agent_session"
-    post_login_redirect_uri: str = "http://localhost:8000/docs"
+    post_login_redirect_uri: str = "http://localhost:8000/"
+    web_dist_path: str = "web/dist"
     external_connection_redirect_uri: str = (
         "http://localhost:8000/api/v1/connections/{server_code}/callback"
     )
@@ -78,6 +95,7 @@ class ModelSettings(BaseModel):
     enabled: bool = False
     base_url: str = ""
     model: str = ""
+    reasoning_effort: ReasoningEffort | None = None
     api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
     api_key_file: str = ""
     request_timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
@@ -313,6 +331,7 @@ class Settings(BaseSettings):
     model: ModelSettings = Field(default_factory=ModelSettings)
     limits: RunLimitSettings = Field(default_factory=RunLimitSettings)
     oidc: OidcSettings = Field(default_factory=OidcSettings)
+    local_auth: LocalAuthSettings = Field(default_factory=LocalAuthSettings)
     permission_system: PermissionSystemSettings = Field(default_factory=PermissionSystemSettings)
     mcp_gateway: McpGatewaySettings = Field(default_factory=McpGatewaySettings)
     credentials: CredentialSettings = Field(default_factory=CredentialSettings)
@@ -333,6 +352,12 @@ class Settings(BaseSettings):
         """Validate completeness and reject insecure production URLs."""
 
         oidc_required = require_oidc or self.oidc.enabled
+        if self.local_auth.registration_enabled and not self.local_auth.enabled:
+            raise ConfigurationError(
+                "Local registration requires local authentication to be enabled."
+            )
+        if self.local_auth.enabled and self.environment == Environment.PRODUCTION:
+            raise ConfigurationError("Local authentication is only available for internal testing.")
         permission_required = require_permission_system or self.permission_system.enabled
 
         if oidc_required:
@@ -426,8 +451,8 @@ class Settings(BaseSettings):
 
     def _validate_platform(self) -> None:
         self._load_secret_files()
-        if not self.oidc.enabled:
-            raise ConfigurationError("OIDC must be enabled when the P1 platform is enabled.")
+        if not self.oidc.enabled and not self.local_auth.enabled:
+            raise ConfigurationError("OIDC must be enabled or local authentication configured.")
         if not self.model.enabled:
             raise ConfigurationError("A model provider must be enabled for Agent runs.")
         if not self.platform.database_url.startswith("postgresql+asyncpg://"):

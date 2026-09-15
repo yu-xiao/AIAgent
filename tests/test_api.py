@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
 from ai_agent.api import create_app
-from ai_agent.config import Environment, PermissionSystemSettings, SecuritySettings, Settings
+from ai_agent.config import (
+    Environment,
+    PermissionSystemSettings,
+    PlatformSettings,
+    SecuritySettings,
+    Settings,
+)
 from ai_agent.errors import ConfigurationError
 
 
@@ -82,3 +90,27 @@ async def test_development_keeps_debug_documents() -> None:
 
     assert docs.status_code == 200
     assert openapi.status_code == 200
+
+
+async def test_built_web_app_is_served_with_security_headers(tmp_path: Path) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (tmp_path / "index.html").write_text("<main>Enterprise AI Agent</main>", encoding="utf-8")
+    (assets / "app.js").write_text("export {};", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        platform=PlatformSettings(web_dist_path=str(tmp_path)),
+    )
+    app = create_app(settings)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        index = await client.get("/")
+        script = await client.get("/assets/app.js")
+
+    assert index.status_code == 200
+    assert "Enterprise AI Agent" in index.text
+    assert script.status_code == 200
+    assert "default-src 'self'" in index.headers["Content-Security-Policy"]

@@ -163,6 +163,27 @@ async def get_conversation(
     )
 
 
+@router.get(
+    "/conversations/{conversation_id}/runs",
+    response_model=list[RunView],
+    tags=["runs"],
+)
+async def list_conversation_runs(
+    conversation_id: UUID,
+    request: Request,
+    identity: CurrentIdentity,
+    organization_id: OrganizationId,
+    limit: Limit = 20,
+) -> list[RunView]:
+    runs = await request.app.state.services.conversations.list_conversation_runs(
+        identity.session.user_id,
+        organization_id,
+        conversation_id,
+        limit=limit,
+    )
+    return [_run_view(run) for run in runs]
+
+
 @router.post(
     "/conversations/{conversation_id}/messages",
     response_model=RunView,
@@ -190,7 +211,7 @@ async def create_message_run(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent Runs are disabled by the operational switch.",
-    )
+        )
     if external_worker:
         if (
             services.worker_registry is None

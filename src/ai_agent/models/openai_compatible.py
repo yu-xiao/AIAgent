@@ -45,6 +45,8 @@ class OpenAICompatibleProvider:
             "stream_options": {"include_usage": True},
             "max_tokens": max_output_tokens,
         }
+        if self._settings.reasoning_effort is not None:
+            payload["reasoning_effort"] = self._settings.reasoning_effort.value
         if tools:
             payload["tools"] = tools
         headers = {

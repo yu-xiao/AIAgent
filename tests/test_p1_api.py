@@ -43,6 +43,13 @@ async def test_conversation_run_sse_idempotency_and_audit(
     completed = await _wait_for_terminal(runtime, run_id)
     assert completed["status"] == RunStatus.COMPLETED.value
 
+    recent_runs = await runtime.client.get(
+        f"/api/v1/conversations/{conversation_id}/runs?limit=1",
+        headers=runtime.headers,
+    )
+    assert recent_runs.status_code == 200
+    assert [item["id"] for item in recent_runs.json()] == [run_id]
+
     events = await runtime.client.get(
         f"/api/v1/runs/{run_id}/events",
         headers=runtime.headers,

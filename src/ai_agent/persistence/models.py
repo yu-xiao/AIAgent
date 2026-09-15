@@ -128,6 +128,16 @@ class User(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class LocalCredential(Base):
+    __tablename__ = "local_credentials"
+
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+
+
 class Organization(TimestampMixin, Base):
     __tablename__ = "organizations"
 
