@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ai_agent.agents.api import router as agent_router
 from ai_agent.audit.api import router as audit_router
 from ai_agent.config import Environment, Settings
 from ai_agent.connections.api import router as connection_router
@@ -132,6 +133,7 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
     app.state.settings = runtime_settings
     app.state.services = services
     app.include_router(identity_router)
+    app.include_router(agent_router)
     app.include_router(conversation_router)
     app.include_router(connection_router)
     app.include_router(mcp_router)
@@ -312,6 +314,8 @@ def create_app(settings: Settings | None = None, services: AppServices | None = 
                 "langgraph_single_agent": True,
                 "sse_run_events": True,
                 "run_cancellation": True,
+                "managed_agent_versions": True,
+                "agent_control_mode": runtime_settings.agent_control.mode.value,
                 "audit": True,
                 "hard_limits": True,
             },

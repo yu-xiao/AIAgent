@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_agent.errors import ConfigurationError
@@ -33,6 +33,12 @@ class CredentialVaultBackend(StrEnum):
 class ExecutionMode(StrEnum):
     EMBEDDED = "embedded"
     EXTERNAL_WORKER = "external_worker"
+
+
+class AgentControlMode(StrEnum):
+    LEGACY = "legacy"
+    MANAGED_OPTIONAL = "managed_optional"
+    MANAGED_REQUIRED = "managed_required"
 
 
 class OidcSettings(BaseModel):
@@ -75,6 +81,8 @@ class ModelSettings(BaseModel):
 
 
 class RunLimitSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     max_question_characters: int = Field(default=4_000, ge=1, le=100_000)
     max_model_rounds: int = Field(default=6, ge=1, le=50)
     max_tool_calls: int = Field(default=10, ge=0, le=100)
@@ -225,6 +233,10 @@ class ExecutionSettings(BaseModel):
         return self
 
 
+class AgentControlSettings(BaseModel):
+    mode: AgentControlMode = AgentControlMode.LEGACY
+
+
 class ObservabilitySettings(BaseModel):
     tracing_enabled: bool = False
     service_name: str = "enterprise-ai-agent"
@@ -294,6 +306,7 @@ class Settings(BaseSettings):
     credentials: CredentialSettings = Field(default_factory=CredentialSettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    agent_control: AgentControlSettings = Field(default_factory=AgentControlSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
 

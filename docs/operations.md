@@ -120,6 +120,20 @@ Attempt 结果由租约令牌保护并在同一数据库事务提交。执行前
 相同的已批准镜像 Digest，启动并确认 `ai-agent worker-health` 成功后重新开放 Run。数据库
 迁移保留，回滚应用时不得删除 `run_jobs` 或 `run_job_attempts`。
 
+## 受管 Agent 版本
+
+第三批第一阶段提供 `legacy`、`managed_optional` 和 `managed_required` 三种模式。开发环境先将
+`AI_AGENT_AGENT_CONTROL__MODE` 设置为 `managed_optional`：存在默认 Agent 的已发布版本时，
+新 Run 固化其 Agent ID、Version ID、配置摘要和限制快照；没有部署时继续使用全局配置。
+
+生产环境在 EvalOps 发布门禁落地前保持 `legacy`。生产发布接口默认拒绝无门禁发布，仅允许
+拥有 `agent:release:bypass` 权限的管理员填写原因后显式绕过，且绕过行为写入审计。完成默认
+Agent 数据迁移、灰度和评测门禁后，才能将生产切换到 `managed_required`。
+
+已发布版本不可原地修改。回滚通过创建新的 Release 记录并移动 Deployment 指针完成，历史
+Run 仍引用原版本。任何数据库恢复或手工排障都不得修改 `agent_versions.config_snapshot` 或
+`config_digest`。
+
 ## 凭证轮换
 
 - Vault Token 通过文件读取，每次 Vault 请求都会重新加载；原子替换 Token 文件后无需

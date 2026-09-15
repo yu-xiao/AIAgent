@@ -97,6 +97,7 @@ class SingleAgent:
         )
         if tool_allowlist is not None:
             definitions = [item for item in definitions if item.name in tool_allowlist]
+        definitions_by_name = {item.name: item for item in definitions}
         provider_tools = [_provider_tool(definition) for definition in definitions]
         working_messages = list(messages)
         all_citations: list[Citation] = []
@@ -133,9 +134,10 @@ class SingleAgent:
             )
             for call in tool_calls:
                 tool_calls_used += 1
-                if tool_allowlist is not None and call.name not in tool_allowlist:
+                definition = definitions_by_name.get(call.name)
+                if definition is None:
                     raise ModelProviderError(
-                        "Agent requested a Tool outside the configured allowlist."
+                        "Agent requested a Tool outside the configured allowlist or catalog."
                     )
                 result = await _call_gateway(
                     gateway,
@@ -149,17 +151,19 @@ class SingleAgent:
                 all_citations.extend(result.citations)
                 if result.citation is not None and not result.citations:
                     all_citations.append(result.citation)
-                if result.citation is not None:
-                    invocations.append(
-                        ToolInvocationRecord(
-                            tool_name=call.name,
-                            server_code=result.citation.server_code,
-                            status="failed" if result.is_error else "succeeded",
-                            arguments_digest=_digest_arguments(call.arguments),
-                            trace_id=trace_id,
-                            duration_ms=result.duration_ms,
-                        )
+                citation = result.citation or next(iter(result.citations), None)
+                invocations.append(
+                    ToolInvocationRecord(
+                        tool_name=call.name,
+                        server_code=(
+                            citation.server_code if citation is not None else definition.server_code
+                        ),
+                        status="failed" if result.is_error else "succeeded",
+                        arguments_digest=_digest_arguments(call.arguments),
+                        trace_id=trace_id,
+                        duration_ms=result.duration_ms,
                     )
+                )
         raise ModelProviderError("Agent exceeded the configured model round limit.")
 
     def _round_output_limit(

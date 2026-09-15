@@ -11,6 +11,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
+from ai_agent.agents.control import AgentControlService
 from ai_agent.audit.service import AuditService
 from ai_agent.config import CredentialVaultBackend, ExecutionMode, Settings
 from ai_agent.connections.service import ConnectionService
@@ -66,6 +67,7 @@ class AppServices:
     catalog: ToolCatalogService | None = None
     gateway: McpGateway | None = None
     permission_system: PermissionSystemService | None = None
+    agent_control: AgentControlService | None = None
 
     async def ping(self) -> None:
         await self.database.ping()
@@ -122,6 +124,15 @@ def build_services(settings: Settings) -> AppServices:
         key_id=settings.governance.audit_integrity_key_id,
     )
     identities = IdentityService(database.session_factory, audit)
+    agent_control = AgentControlService(
+        database.session_factory,
+        identities,
+        settings.limits,
+        settings.model.system_prompt,
+        mode=settings.agent_control.mode,
+        environment=settings.environment,
+        audit=audit,
+    )
     conversations = ConversationService(
         database.session_factory,
         identities,
@@ -129,6 +140,7 @@ def build_services(settings: Settings) -> AppServices:
         audit,
         durable_jobs_enabled=settings.execution.mode == ExecutionMode.EXTERNAL_WORKER,
         job_max_attempts=settings.execution.max_attempts,
+        agent_control=agent_control,
     )
     jobs = RunJobService(database.session_factory, audit)
     worker_registry = RedisWorkerRegistry(redis)
@@ -236,6 +248,7 @@ def build_services(settings: Settings) -> AppServices:
         catalog=catalog,
         gateway=gateway,
         permission_system=permission_system,
+        agent_control=agent_control,
     )
 
 

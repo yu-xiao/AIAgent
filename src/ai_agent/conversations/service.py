@@ -8,9 +8,10 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_agent.agents.control import AgentControlService, AgentVersionConfig
 from ai_agent.audit.service import AuditService
 from ai_agent.config import RunLimitSettings
-from ai_agent.errors import ConflictError, ResourceNotFoundError, RunLimitError
+from ai_agent.errors import ConfigurationError, ConflictError, ResourceNotFoundError, RunLimitError
 from ai_agent.identity.service import AGENT_USE, IdentityService
 from ai_agent.mcp.models import Citation as CitationValue
 from ai_agent.mcp.models import ToolInvocationRecord
@@ -49,6 +50,7 @@ class ConversationService:
         *,
         durable_jobs_enabled: bool = False,
         job_max_attempts: int = 3,
+        agent_control: AgentControlService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._identities = identities
@@ -56,6 +58,7 @@ class ConversationService:
         self._audit = audit or AuditService()
         self._durable_jobs_enabled = durable_jobs_enabled
         self._job_max_attempts = job_max_attempts
+        self._agent_control = agent_control
 
     async def recover_incomplete_runs(self, stale_before: datetime) -> list[Run]:
         """Fail abandoned running work and return durable queued work for resubmission."""
@@ -179,6 +182,7 @@ class ConversationService:
         content: str,
         idempotency_key: str | None,
         trace_id: UUID,
+        agent_id: UUID | None = None,
     ) -> tuple[Run, bool]:
         await self._identities.access(user_id, organization_id, AGENT_USE)
         if len(content) > self._limits.max_question_characters:
@@ -194,6 +198,16 @@ class ConversationService:
                 )
                 if existing is not None:
                     return existing, False
+            resolved_agent = (
+                await self._agent_control.resolve_for_run(session, organization_id, agent_id)
+                if self._agent_control is not None
+                else None
+            )
+            if (
+                resolved_agent is not None
+                and len(content) > resolved_agent.config.limits.max_question_characters
+            ):
+                raise RunLimitError("Question exceeds the managed Agent character limit.")
             conversation = await session.scalar(
                 select(Conversation)
                 .where(
@@ -228,7 +242,18 @@ class ConversationService:
                 user_message_id=message.id,
                 idempotency_key=idempotency_key,
                 trace_id=trace_id,
-                limits_snapshot=self._limits.model_dump(mode="json"),
+                limits_snapshot=(
+                    resolved_agent.config.limits.model_dump(mode="json")
+                    if resolved_agent is not None
+                    else self._limits.model_dump(mode="json")
+                ),
+                agent_id=resolved_agent.agent_id if resolved_agent is not None else None,
+                agent_version_id=(
+                    resolved_agent.version_id if resolved_agent is not None else None
+                ),
+                agent_config_digest=(
+                    resolved_agent.config_digest if resolved_agent is not None else None
+                ),
             )
             session.add(run)
             conversation.updated_at = datetime.now(UTC)
@@ -250,10 +275,35 @@ class ConversationService:
                     resource_type="run",
                     resource_id=str(run.id),
                     trace_id=run.trace_id,
-                    details={"conversation_id": str(conversation_id)},
+                    details={
+                        "conversation_id": str(conversation_id),
+                        "agent_id": str(resolved_agent.agent_id) if resolved_agent else None,
+                        "agent_version_id": (
+                            str(resolved_agent.version_id) if resolved_agent else None
+                        ),
+                        "agent_config_digest": (
+                            resolved_agent.config_digest if resolved_agent else None
+                        ),
+                    },
                 )
             )
             return run, True
+
+    async def load_agent_config(self, run: Run) -> AgentVersionConfig | None:
+        values = (run.agent_id, run.agent_version_id, run.agent_config_digest)
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values) or self._agent_control is None:
+            raise ConfigurationError("Run has an incomplete managed Agent binding.")
+        assert run.agent_id is not None
+        assert run.agent_version_id is not None
+        assert run.agent_config_digest is not None
+        return await self._agent_control.load_run_config(
+            run.organization_id,
+            run.agent_id,
+            run.agent_version_id,
+            run.agent_config_digest,
+        )
 
     async def get_run(self, user_id: UUID, organization_id: UUID, run_id: UUID) -> Run:
         await self._identities.access(user_id, organization_id, AGENT_USE)

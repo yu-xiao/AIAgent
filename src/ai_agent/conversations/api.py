@@ -42,6 +42,7 @@ class MessageCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1)
+    agent_id: UUID | None = None
 
 
 class MessageView(BaseModel):
@@ -79,6 +80,9 @@ class RunView(BaseModel):
     conversation_id: UUID
     status: str
     trace_id: UUID
+    agent_id: UUID | None
+    agent_version_id: UUID | None
+    agent_config_digest: str | None
     error_code: str | None
     error_message: str | None
     cancellation_requested_at: datetime | None
@@ -228,6 +232,7 @@ async def create_message_run(
             content,
             idempotency_key,
             request.state.trace_id,
+            payload.agent_id,
         )
     except Exception:
         if services.quota is not None and quota_lease is not None:
@@ -478,6 +483,9 @@ def _run_view(run: Run, citations: list[object] | None = None) -> RunView:
         conversation_id=run.conversation_id,
         status=run.status.value,
         trace_id=run.trace_id,
+        agent_id=run.agent_id,
+        agent_version_id=run.agent_version_id,
+        agent_config_digest=run.agent_config_digest,
         error_code=run.error_code,
         error_message=run.error_message,
         cancellation_requested_at=run.cancellation_requested_at,

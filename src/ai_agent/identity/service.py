@@ -22,6 +22,11 @@ from ai_agent.persistence.models import (
 
 AGENT_USE = "agent:use"
 AGENT_MANAGE = "agent:manage"
+AGENT_VIEW = "agent:view"
+AGENT_DRAFT_WRITE = "agent:draft:write"
+AGENT_VERSION_CREATE = "agent:version:create"
+AGENT_RELEASE = "agent:release"
+AGENT_RELEASE_BYPASS = "agent:release:bypass"
 AUDIT_VIEW = "audit:view"
 ORGANIZATION_MEMBER_MANAGE = "organization:member:manage"
 CONNECTION_PERSONAL_CREATE = "connection:personal:create"
@@ -47,6 +52,11 @@ MEMBER_ROLE = "member"
 PERMISSION_DEFINITIONS = {
     AGENT_USE: "Use the organization's Agent.",
     AGENT_MANAGE: "Manage Agent definitions and runtime switches.",
+    AGENT_VIEW: "View the organization's managed Agents.",
+    AGENT_DRAFT_WRITE: "Create and update Agent drafts.",
+    AGENT_VERSION_CREATE: "Create immutable Agent versions.",
+    AGENT_RELEASE: "Release and roll back evaluated Agent versions.",
+    AGENT_RELEASE_BYPASS: "Bypass an Agent release gate with an audited reason.",
     AUDIT_VIEW: "View organization audit records.",
     ORGANIZATION_MEMBER_MANAGE: "Manage organization members and roles.",
     CONNECTION_PERSONAL_CREATE: "Create personal external connections.",

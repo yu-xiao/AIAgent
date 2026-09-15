@@ -9,6 +9,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from ai_agent.agents.control import AgentControlService
 from ai_agent.api import create_app
 from ai_agent.audit.service import AuditService
 from ai_agent.config import ModelSettings, OidcSettings, PlatformSettings, Settings
@@ -30,6 +31,8 @@ class FakeModelProvider:
 
     def __init__(self) -> None:
         self.gate: asyncio.Event | None = None
+        self.last_messages: list[ModelMessage] = []
+        self.last_max_output_tokens: int | None = None
 
     def conservative_input_tokens(self, messages: list[ModelMessage]) -> int:
         return sum(len(item.content.encode("utf-8")) + 8 for item in messages)
@@ -41,7 +44,9 @@ class FakeModelProvider:
         max_output_tokens: int,
         trace_id: str,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del max_output_tokens, trace_id
+        del trace_id
+        self.last_messages = list(messages)
+        self.last_max_output_tokens = max_output_tokens
         if self.gate is not None:
             await self.gate.wait()
         answer = f"Echo: {messages[-1].content}"
@@ -97,11 +102,21 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
     sessions = MemorySessionStore()
     audit = AuditService(b"test-audit-key", key_id="test-v1")
     identities = IdentityService(database.session_factory, audit)
+    agent_control = AgentControlService(
+        database.session_factory,
+        identities,
+        settings.limits,
+        settings.model.system_prompt,
+        mode=settings.agent_control.mode,
+        environment=settings.environment,
+        audit=audit,
+    )
     conversations = ConversationService(
         database.session_factory,
         identities,
         settings.limits,
         audit,
+        agent_control=agent_control,
     )
     backend = MemoryRunBackend()
     provider = FakeModelProvider()
@@ -126,6 +141,7 @@ async def platform_runtime() -> AsyncIterator[PlatformRuntime]:
         executor=executor,
         provider=provider,
         audit=audit,
+        agent_control=agent_control,
     )
     user = await identities.upsert_oidc_user(
         issuer=settings.oidc.issuer,

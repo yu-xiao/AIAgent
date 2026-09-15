@@ -1,6 +1,6 @@
 # Enterprise AI Agent
 
-这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0-P3 及跳过 P4 后的 P5 生产治理：独立 OIDC 会话、组织 RBAC、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、持久 Run Job 与独立 Worker、Run/SSE/取消、硬限制、追加式审计、可信 MCP Server 注册、PermissionSystem 个人/组织连接、隔离 Tool Catalog、HashiCorp Vault、分布式配额、跨实例 MCP 限流/熔断、指标、Trace、审计留存和蓝绿发布制品。金蝶、MES、BI 暂未接入。
+这是企业 AI 智能体平台的 Python 3.12 项目。当前实现包含 P0-P3 及跳过 P4 后的 P5 生产治理：独立 OIDC 会话、组织 RBAC、版本化 Agent 草稿/发布/回滚、PostgreSQL/Redis 持久化、LangGraph 单智能体、模型流式响应、持久 Run Job 与独立 Worker、Run/SSE/取消、硬限制、追加式审计、可信 MCP Server 注册、PermissionSystem 个人/组织连接、隔离 Tool Catalog、HashiCorp Vault、分布式配额、跨实例 MCP 限流/熔断、指标、Trace、审计留存和蓝绿发布制品。金蝶、MES、BI 暂未接入。
 
 P1 的模型供应商、模型名、Base URL 和 API Key 只从本地环境变量读取，不写入仓库。P2 的 Token、Refresh Token 和 Client Secret 只进入 CredentialVault，不保存到数据库或普通日志。
 

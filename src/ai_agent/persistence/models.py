@@ -57,6 +57,20 @@ class RunJobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class AgentStatus(StrEnum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class AgentReleaseAction(StrEnum):
+    DEPLOY = "deploy"
+    ROLLBACK = "rollback"
+
+
+class AgentReleaseStatus(StrEnum):
+    DEPLOYED = "deployed"
+
+
 class McpTransport(StrEnum):
     STREAMABLE_HTTP = "streamable_http"
 
@@ -205,6 +219,163 @@ class Message(Base):
     )
 
 
+class AgentDefinition(TimestampMixin, Base):
+    __tablename__ = "agent_definitions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "code", name="uq_agent_definitions_org_code"),
+        Index("ix_agent_definitions_org_status", "organization_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(100), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(String(1_000), nullable=False, default="")
+    status: Mapped[AgentStatus] = mapped_column(
+        Enum(
+            AgentStatus,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=AgentStatus.ACTIVE,
+    )
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+Index(
+    "uq_agent_definitions_one_default_org",
+    AgentDefinition.organization_id,
+    unique=True,
+    postgresql_where=AgentDefinition.is_default.is_(True),
+    sqlite_where=AgentDefinition.is_default.is_(True),
+)
+
+
+class AgentDraft(TimestampMixin, Base):
+    __tablename__ = "agent_drafts"
+
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="CASCADE"), primary_key=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    updated_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class AgentVersion(Base):
+    __tablename__ = "agent_versions"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "version_number", name="uq_agent_versions_number"),
+        Index("ix_agent_versions_org_agent", "organization_id", "agent_id", "version_number"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    config_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class AgentDeployment(TimestampMixin, Base):
+    __tablename__ = "agent_deployments"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "environment", name="uq_agent_deployments_environment"),
+        Index("ix_agent_deployments_org_environment", "organization_id", "environment"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(30), nullable=False)
+    version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    deployed_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
+class AgentRelease(Base):
+    __tablename__ = "agent_releases"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "idempotency_key", name="uq_agent_releases_org_idempotency"
+        ),
+        Index("ix_agent_releases_org_agent", "organization_id", "agent_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    previous_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("agent_versions.id", ondelete="RESTRICT")
+    )
+    environment: Mapped[str] = mapped_column(String(30), nullable=False)
+    action: Mapped[AgentReleaseAction] = mapped_column(
+        Enum(
+            AgentReleaseAction,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+    )
+    status: Mapped[AgentReleaseStatus] = mapped_column(
+        Enum(
+            AgentReleaseStatus,
+            native_enum=False,
+            length=20,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=False,
+        default=AgentReleaseStatus.DEPLOYED,
+    )
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    bypassed_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    requested_by: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
 class Run(Base):
     __tablename__ = "runs"
     __table_args__ = (
@@ -230,6 +401,13 @@ class Run(Base):
     assistant_message_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL")
     )
+    agent_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("agent_definitions.id", ondelete="RESTRICT"), index=True
+    )
+    agent_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"), index=True
+    )
+    agent_config_digest: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[RunStatus] = mapped_column(
         Enum(
             RunStatus,
