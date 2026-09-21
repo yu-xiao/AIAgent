@@ -20,7 +20,7 @@ dependencies = [
     "pydantic>=2.11.0,<3",
     "pydantic-settings>=2.10.0,<3",
     "pyjwt[crypto]>=2.10.0,<3",
-    "redis>=6.2.0,<8",
+    "redis>=6.2.0,<9",
     "sqlalchemy[asyncio]>=2.0.40,<3",
     "uvicorn[standard]>=0.35.0,<1",
 ]
@@ -32,17 +32,17 @@ ai-agent = "ai_agent.cli:main"
 dev = [
     "aiosqlite>=0.21.0,<1",
     "fakeredis[lua]>=2.31.0,<3",
-    "mypy>=1.17.0,<2",
+    "mypy>=1.17.0,<3",
     "pytest>=8.4.0,<10",
     "pytest-asyncio>=1.1.0,<2",
     "respx>=0.22.0,<1",
     "ruff>=0.12.0,<1",
-    "setuptools>=80.0.0,<82",
+    "setuptools>=80.0.0,<85",
     "types-jsonschema>=4.23.0,<5",
 ]
 
 [build-system]
-requires = ["setuptools>=80.0.0,<82"]
+requires = ["setuptools>=80.0.0,<85"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
